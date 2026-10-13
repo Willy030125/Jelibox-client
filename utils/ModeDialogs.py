@@ -317,7 +317,7 @@ class CustomHeadDialog(_Dialog):
                          "one of your own classes.", pady=(0, 8))
 
         card = self.card(body)
-        self.label(card, "HEAD CHECKPOINT (head_best.pt)", size=8, bold=True)
+        self.label(card, "HEAD CHECKPOINT (head_best.pt) - leave empty until you have trained one", size=8, bold=True)
         row = tk.Frame(card, bg=C_CARD)
         row.pack(fill=tk.X, pady=(4, 0))
         self.path_var = tk.StringVar(value=h["head_path"])
@@ -352,6 +352,17 @@ class CustomHeadDialog(_Dialog):
         self.slider(card, "Detector confidence", self.conf_var, 0.05, 0.95, 0.05)
         self.slider(card, "Detector NMS IoU", self.iou_var, 0.1, 0.9, 0.05)
         self.slider(card, "Minimum head confidence", self.min_head_var, 0.0, 0.95, 0.05)
+
+        card = self.card(body)
+        self.label(card, "ANNOTATE ALL WITHOUT A TRAINED HEAD", size=8, bold=True)
+        row = tk.Frame(card, bg=C_CARD)
+        row.pack(fill=tk.X, pady=(4, 0))
+        tk.Label(row, text="Detector model", bg=C_CARD, fg=C_TXT2, font=('Segoe UI', 9), width=24, anchor='w').pack(side=tk.LEFT)
+        self.pre_var = tk.StringVar(value=h["pre_detector"])
+        self.combo(row, self.pre_var, list(wcfg.PRE_DETECTORS), 22).pack(side=tk.LEFT)
+        self.label(card, "Annotate all can draw the boxes of \"Detect these classes\" (e.g. person) with this stock COCO "
+                         "model, before any head exists: pick \"Draw boxes with a COCO detector\" there. Downloaded once on "
+                         "first use. Independent of the detector your head was trained on.", size=8, fg=C_TXT3, pady=(4, 0))
 
         card = self.card(body, pady=(0, 4))
         self.label(card, "HEAD CLASS  →  WORKSPACE CLASS", size=8, bold=True)
@@ -433,8 +444,11 @@ class CustomHeadDialog(_Dialog):
             ck = ch.read_checkpoint(full)
             self.head_names = list(ck["names"])
             cfg = ck["cfg"]
+            kind = ("detect head: finds its own boxes (\"Detect these classes\" and NMS IoU are not used; the confidence "
+                    "is its score threshold)" if ck["kind"] == "detect" else "classify head")
             self.head_info.config(fg=C_GREEN, text=f"{len(self.head_names)} classes: {', '.join(self.head_names)}   |   "
-                                                   f"detector {cfg['weights']}, {cfg['imgsz'][0]}x{cfg['imgsz'][1]}")
+                                                   f"detector {cfg['weights']}, {cfg['imgsz'][0]}x{cfg['imgsz'][1]}   |   "
+                                                   f"{kind}", wraplength=640, justify=tk.LEFT)
         except Exception as exc:
             self.head_names = []
             self.head_info.config(fg=C_AMBER, text=str(exc).split("\n")[0])
@@ -460,11 +474,8 @@ class CustomHeadDialog(_Dialog):
         self.fit()
 
     def save(self):
-        path = self.path_var.get().strip()
-        if not path:
-            messagebox.showwarning("Label Assistant", "Choose the head checkpoint (head_best.pt) first.", parent=self.win)
-            return
-        if not os.path.isfile(providers.resolve_head_path(path, BASE_DIR)):
+        path = self.path_var.get().strip()       # empty is fine: Annotate all can still use the detector alone
+        if path and not os.path.isfile(providers.resolve_head_path(path, BASE_DIR)):
             messagebox.showwarning("Label Assistant", f"The head checkpoint was not found:\n{path}", parent=self.win)
             return
         weights = self.weights_var.get().strip()
@@ -486,7 +497,7 @@ class CustomHeadDialog(_Dialog):
         h = self.cfg["custom_head"]
         h.update(head_path=path, detector_weights=self.weights_var.get().strip(), detector_classes=ids,
                  iou=round(float(self.iou_var.get()), 2), min_head_conf=round(float(self.min_head_var.get()), 2),
-                 class_map=class_map)
+                 class_map=class_map, pre_detector=self.pre_var.get())
         self.cfg["confidence"] = round(float(self.conf_var.get()), 2)
         self.cfg["provider"] = wcfg.PROVIDER_HEAD
         wcfg.set_assistant(workspaceName, self.cfg)

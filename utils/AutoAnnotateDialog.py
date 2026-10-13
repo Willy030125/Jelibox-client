@@ -18,9 +18,11 @@ from . import workspace_config as wcfg
 from . import assistant_modes
 from . import file_handler
 from . import inferenceObjectDetection as inf
+from . import assistant_providers as ap
 from .assistant_providers import AssistantError
 from .auto_annotate import BatchWorker, run_batch
-from .config import input_folder, workspaceName
+from .config import input_folder, workspaceName, BASE_DIR
+from .detector_classes import parse_class_ids, format_class_ids
 from .theme import (C_BASE, C_PANEL, C_CARD, C_CARD2, C_BORDER, C_ACCENT, C_TXT1, C_TXT2, C_TXT3,
                     C_ON_ACCENT, C_AMBER, C_GREEN)
 
@@ -115,6 +117,7 @@ class AutoAnnotateDialog:
         self.worker = None
         self.started_at = 0.0
         self.finished = False
+        self._ran_pre = None
 
         self.win = tk.Toplevel(parent)
         self.win.title("Auto-annotate all images")
@@ -137,11 +140,17 @@ class AutoAnnotateDialog:
                  wcfg.PROVIDER_LOCATE: "LocateAnything-3B", wcfg.PROVIDER_HEAD: "your custom head model"}
         tk.Label(self.win, text="AUTO-ANNOTATE ALL IMAGES", bg=C_BASE, fg=C_TXT1,
                  font=('Segoe UI', 12, 'bold')).pack(padx=22, pady=(18, 2), anchor='w')
+        how = ("choose how to annotate below" if self.mode == assistant_modes.MODE_HEAD
+               else f"annotating with {names.get(provider, provider)}")
         tk.Label(self.win, bg=C_BASE, fg=C_TXT2, font=('Segoe UI', 9), wraplength=476, justify=tk.LEFT,
-                 text=f"Mode: {assistant_modes.title(self.mode)} - annotating with {names.get(provider, provider)}.\n"
+                 text=f"Mode: {assistant_modes.title(self.mode)} - {how}.\n"
                       f"{len(self.images)} image(s) in {os.path.basename(os.path.normpath(input_folder))}. "
                       f"New annotations are merged into what is already there; existing ones are never changed."
                  ).pack(padx=22, anchor='w')
+
+        self.variant = None
+        if self.mode == assistant_modes.MODE_HEAD:
+            self._build_variant()
 
         self.only_var = tk.BooleanVar(value=self.cfg["batch"]["only_unlabeled"])
         self.only_check = tk.Checkbutton(
@@ -170,18 +179,92 @@ class AutoAnnotateDialog:
                                    activebackground=C_CARD2, activeforeground=C_TXT1, borderwidth=0)
         self.close_btn.pack(side=tk.RIGHT, padx=8, ipadx=16, ipady=4)
 
+    def _build_variant(self):
+        """Custom head mode: two ways to annotate everything. 'detector' = a stock COCO detector (chosen in Label
+        Assistant) draws the boxes of "Detect these classes" in one class, for when no head is trained yet;
+        'head' = the trained head names every box."""
+        h = self.cfg["custom_head"]
+        classes = inf.current_classes()
+        head_ok = bool(h["head_path"]) and os.path.isfile(ap.resolve_head_path(h["head_path"], BASE_DIR))
+        self.variant = tk.StringVar(value=h["annotate_with"] if head_ok else "detector")
+        box = tk.Frame(self.win, bg=C_BASE)
+        box.pack(fill=tk.X, padx=22, pady=(12, 0))
+        self.radios = []
+        for value, text, enabled in (
+                ("detector", f"Draw boxes with a COCO detector ({h['pre_detector']}), no trained head needed", True),
+                ("head", "Annotate with my trained head" + ("" if head_ok else "  (no head chosen yet)"), head_ok)):
+            rb = tk.Radiobutton(box, text=text, value=value, variable=self.variant, command=self._variant_changed,
+                                bg=C_BASE, fg=C_TXT1, selectcolor=C_CARD, activebackground=C_BASE,
+                                activeforeground=C_TXT1, font=('Segoe UI', 9), highlightthickness=0, bd=0,
+                                cursor='hand2', anchor='w', state=tk.NORMAL if enabled else tk.DISABLED)
+            rb.pack(anchor='w')
+            self.radios.append(rb)
+
+        row = tk.Frame(box, bg=C_BASE)
+        row.pack(fill=tk.X, padx=(22, 0), pady=(4, 0))
+        tk.Label(row, text="Label the boxes as", bg=C_BASE, fg=C_TXT2, font=('Segoe UI', 9)).pack(side=tk.LEFT, padx=(0, 8))
+        self.pre_label = tk.StringVar(value=h["pre_label"] if h["pre_label"] in classes else (classes[0] if classes else ""))
+        self.label_combo = ttk.Combobox(row, textvariable=self.pre_label, values=classes, state='readonly', width=20)
+        self.label_combo.pack(side=tk.LEFT)
+        tk.Label(box, bg=C_BASE, fg=C_TXT3, font=('Segoe UI', 8), wraplength=470, justify=tk.LEFT,
+                 text=f"Draws {format_class_ids(h['detector_classes'])} at confidence {self.cfg['confidence']:.2f}. "
+                      f"Detector, classes and confidence are set in Label Assistant. Every box gets the class above: "
+                      f"fix the wrong ones afterwards, or let your trained head name them later."
+                 ).pack(anchor='w', padx=(22, 0), pady=(2, 0))
+        self._variant_changed()
+
+    def _variant_changed(self):
+        self.label_combo.config(state='readonly' if self.variant.get() == "detector" else tk.DISABLED)
+
+    def _detector_options(self):
+        """(weights, label) for the detector variant, or None after telling the user what is wrong."""
+        label = self.pre_label.get()
+        if label not in inf.current_classes():
+            messagebox.showwarning("Auto-annotate", "Choose the class the drawn boxes should get "
+                                   "(add classes to the workspace first).", parent=self.win)
+            return None
+        weights = self.cfg["custom_head"]["pre_detector"]
+        if not os.path.exists(ap.detector_file(weights, BASE_DIR)) and not messagebox.askyesno(
+                "Detector download",
+                f"{weights} is not on this computer yet.\n\nJelibox will download it once from the Ultralytics "
+                f"releases on GitHub (about 50-80 MB) into\n{os.path.join(BASE_DIR, 'models', '_detectors')}\n\n"
+                f"Download now?", parent=self.win):
+            return None
+        return weights, label
+
+    def _set_controls(self, enabled):
+        self.only_check.config(state=tk.NORMAL if enabled else tk.DISABLED)
+        if self.variant is not None:
+            for rb in self.radios:
+                rb.config(state=tk.NORMAL if enabled else tk.DISABLED)
+            if enabled:
+                self._variant_changed()
+            else:
+                self.label_combo.config(state=tk.DISABLED)
+
     # ------------------------------------------------------------------ run
     def _start(self):
         if not self.images:
             return
         if not confirm_download_if_needed(self.win, self.mode):
             return
+        pre = None
+        if self.variant is not None and self.variant.get() == "detector":
+            pre = self._detector_options()
+            if pre is None:
+                return
         if self.before_start:
             self.before_start()
         self.cfg["batch"]["only_unlabeled"] = bool(self.only_var.get())
+        if self.variant is not None:
+            h = self.cfg["custom_head"]
+            h["annotate_with"] = self.variant.get()
+            if pre:
+                h["pre_label"] = pre[1]
         wcfg.set_assistant(workspaceName, self.cfg)
+        self._ran_pre = pre
 
-        self.only_check.config(state=tk.DISABLED)
+        self._set_controls(False)
         self.start_btn.config(text="Stop", command=self._stop, bg=C_AMBER)
         self.close_btn.config(state=tk.DISABLED)
         self.started_at = time.time()
@@ -189,8 +272,15 @@ class AutoAnnotateDialog:
         mode = self.mode
         classes = inf.current_classes()
 
+        head_cfg = self.cfg["custom_head"]
+        conf = self.cfg["confidence"]
+
         def work(status, progress, cancel_flag):
-            predict = inf.build_predictor(mode, status)
+            if pre:
+                status("Loading the detector ...")
+                predict = ap.detector_predictor(pre[0], conf, head_cfg["detector_classes"], pre[1], BASE_DIR)
+            else:
+                predict = inf.build_predictor(mode, status)
             status("Annotating ...")
             return run_batch(
                 self.images,
@@ -227,7 +317,7 @@ class AutoAnnotateDialog:
         self.finished = True
         self.start_btn.config(state=tk.NORMAL, text="Start", command=self._start, bg=C_ACCENT)
         self.close_btn.config(state=tk.NORMAL)
-        self.only_check.config(state=tk.NORMAL)
+        self._set_controls(True)
         if error is not None:
             self.count_label.config(text="Stopped.")
             self.status_label.config(text="")
@@ -245,6 +335,8 @@ class AutoAnnotateDialog:
             detail = "\n\nFailed images:\n" + "\n".join(f"  {n}: {m}" for n, m in result.failed[:8])
             if len(result.failed) > 8:
                 detail += f"\n  ... and {len(result.failed) - 8} more"
+        if self._ran_pre and result.added:
+            detail += f"\n\nEvery new box was labelled '{self._ran_pre[1]}': set the right class on the ones that differ."
         messagebox.showinfo("Auto-annotate", result.summary() + detail, parent=self.win)
 
     def _close(self):

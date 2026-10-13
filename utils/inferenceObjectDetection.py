@@ -20,7 +20,8 @@ import torch
 
 from . import workspace_config as wcfg
 from . import assistant_modes
-from .assistant_providers import AssistantError, locate_predictor, head_predictor, map_head_classes as map_classes
+from .assistant_providers import (AssistantError, locate_predictor, head_predictor, map_head_classes as map_classes,
+                                  AUTO_IMGSZ, AUTO_IOU)
 from .annotation_merge import merge as _merge, poly_rect as _poly_rect
 from .config import model_path, class_manager, state, input_folder, workspaceName, BASE_DIR
 
@@ -164,7 +165,7 @@ def build_predictor(mode=None, status=None, conf=None):
 
     def predict(bgr):
         with torch.no_grad():
-            results = model.predict(bgr, conf=conf, iou=0.3, verbose=False)
+            results = model.predict(bgr, conf=conf, iou=AUTO_IOU, imgsz=AUTO_IMGSZ, verbose=False)
         preds, is_polygon = _collect(results, class_name_for)
         del results
         return preds, is_polygon

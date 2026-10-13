@@ -77,6 +77,10 @@ class AnnotationGUI:
         self.start_y = 0
         self.rect_id = None
         self.bbox_rects = []
+        self.edit_tool = 'draw'  # 'draw' a rectangle, or 'select' (move, resize, relabel, reorder)
+        self._drag_origin = None
+        self._cursor = ''
+        self._layer_rows = []
         self.canvas_offset_x = 0
         self.canvas_offset_y = 0
         
@@ -174,7 +178,8 @@ class AnnotationGUI:
         self.root.bind('g', lambda e: self.run_inference())
         self.root.bind('G', lambda e: self.run_auto_annotate_all())
         self.root.bind('e', lambda e: self.repeat_annotations())
-        self.root.bind('b', lambda e: self.toggle_force_new_bbox())
+        self.root.bind('b', lambda e: self.on_tool_key(e, 'draw'))
+        self.root.bind('v', lambda e: self.on_tool_key(e, 'select'))
         self.root.bind('<Delete>', lambda e: self.delete_image())
         self.root.bind('m', lambda e: self.toggle_annotation_mode())
         self.root.bind('<Escape>', lambda e: self.on_escape_pressed())
@@ -231,17 +236,224 @@ class AnnotationGUI:
             self.text_btn.config(text="Show label text")
         self.update_display()
 
-    def update_force_label(self):
-        if state.force_new_bbox:
-            self.force_label.config(text="Force: ON", fg=C_AMBER, bg=C_CARD)
-        else:
-            self.force_label.config(text="Force: OFF", fg=C_TXT3, bg=C_CARD)
+    # ----------------------------------------------------------
+    #  Edit tools: draw a box, or select / move / resize / relabel / reorder
+    # ----------------------------------------------------------
+    HANDLE_R = 6      # radius of the white corner dots (screen pixels)
+    GRAB_R = 10       # how close to a corner a click grabs it
 
-    def toggle_force_new_bbox(self):
-        state.force_new_bbox = not state.force_new_bbox
-        self.update_force_label()
+    if sys.platform == 'win32':
+        RESIZE_CURSORS = {'tl': 'size_nw_se', 'br': 'size_nw_se', 'tr': 'size_ne_sw', 'bl': 'size_ne_sw',
+                          'l': 'size_we', 'r': 'size_we', 't': 'size_ns', 'b': 'size_ns'}
+    else:
+        RESIZE_CURSORS = {'tl': 'top_left_corner', 'br': 'bottom_right_corner', 'tr': 'top_right_corner',
+                          'bl': 'bottom_left_corner', 'l': 'left_side', 'r': 'right_side',
+                          't': 'top_side', 'b': 'bottom_side'}
+
+    def on_tool_key(self, event, tool):
+        if self._typing_in_entry(event):
+            return
+        self.set_edit_tool(tool)
+
+    def set_edit_tool(self, tool):
+        """'draw': every drag draws a new box. 'select': click picks a box, drag moves it, the white dots resize it."""
+        self.edit_tool = tool
+        self.drawing = False
+        self.moving = False
+        self.shift_selecting = False
+        state.resizing = False
+        self._drag_origin = None
+        if tool == 'draw':
+            state.selected_bbox = None
+            state.selected_bboxes = set()
+        for name, btn in self.tool_buttons.items():
+            on = name == tool
+            fg = C_ON_ACCENT if on else C_TXT1
+            btn.config(bg=C_ACCENT if on else C_CARD2, fg=fg, activeforeground=fg,
+                       activebackground=C_ACCENT if on else C_BORDER,
+                       highlightbackground=C_ACCENT if on else C_BORDER)
+        if tool == 'draw':
+            self.tool_label.config(text="  ▭ DRAW BOX  ")
+            self.tool_hint.config(text="Drag on the image to draw a box")
+        else:
+            self.tool_label.config(text="  ✋ SELECT  ")
+            self.tool_hint.config(text="Click a box · drag to move · drag a white dot to resize")
+        self._set_cursor('')
         self.update_display()
-        print(f"[GUI] Force new bbox: {'ON' if state.force_new_bbox else 'OFF'}")
+
+    def _set_cursor(self, name):
+        if name == self._cursor:
+            return
+        try:
+            self.canvas.config(cursor=name)
+            self._cursor = name
+        except tk.TclError:
+            self.canvas.config(cursor='')
+            self._cursor = ''
+
+    def _box_visible(self, i):
+        var = self.visibility_vars.get(state.bboxes[i][4])
+        return True if var is None else var.get()
+
+    def _frontmost_at(self, x_orig, y_orig):
+        """Index of the box on top at this point (a later box is drawn over an earlier one), or None."""
+        for i in range(len(state.bboxes) - 1, -1, -1):
+            x1, y1, x2, y2 = state.bboxes[i][:4]
+            if x1 <= x_orig <= x2 and y1 <= y_orig <= y2 and self._box_visible(i):
+                return i
+        return None
+
+    def _handle_at(self, i, x, y):
+        """Which resize handle of box i is under screen point (x, y): a corner ('tl', 'tr', 'bl', 'br'),
+        an edge ('l', 'r', 't', 'b') or None."""
+        scale = state.display_scale
+        x1, y1, x2, y2 = (int(v * scale) for v in state.bboxes[i][:4])
+        grab = max(4, min(self.GRAB_R, min(x2 - x1, y2 - y1) // 3))
+        for mode, (cx, cy) in (('tl', (x1, y1)), ('tr', (x2, y1)), ('bl', (x1, y2)), ('br', (x2, y2))):
+            if abs(x - cx) <= grab and abs(y - cy) <= grab:
+                return mode
+        tol = min(5, grab)
+        if y1 - tol <= y <= y2 + tol:
+            if abs(x - x1) <= tol:
+                return 'l'
+            if abs(x - x2) <= tol:
+                return 'r'
+        if x1 - tol <= x <= x2 + tol:
+            if abs(y - y1) <= tol:
+                return 't'
+            if abs(y - y2) <= tol:
+                return 'b'
+        return None
+
+    def _update_hover_cursor(self, x, y):
+        cursor = ''
+        sel = state.selected_bbox
+        mode = None
+        if sel is not None and sel < len(state.bboxes) and self._box_visible(sel):
+            mode = self._handle_at(sel, x, y)
+        if mode:
+            cursor = self.RESIZE_CURSORS[mode]
+        elif self._frontmost_at(x / state.display_scale, y / state.display_scale) is not None:
+            cursor = 'fleur'
+        self._set_cursor(cursor)
+
+    def _begin_select_drag(self, x, y):
+        """Select tool, mouse down at screen point (x, y): grab a handle of the selected box, else pick the box
+        on top, else deselect."""
+        state.selected_bboxes = set()
+        state.resizing = False
+        state.resize_mode = None
+        scale = state.display_scale
+        x_orig, y_orig = x / scale, y / scale
+        hit, mode = None, None
+        sel = state.selected_bbox
+        if sel is not None and sel < len(state.bboxes) and self._box_visible(sel):
+            mode = self._handle_at(sel, x, y)       # the dots stick out of the box, so test them first
+            if mode:
+                hit = sel
+        if hit is None:
+            hit = self._frontmost_at(x_orig, y_orig)
+            if hit is not None:
+                mode = self._handle_at(hit, x, y)
+        state.selected_bbox = hit
+        if hit is not None:
+            self._drag_origin = (x_orig, y_orig, list(state.bboxes[hit][:4]))
+            if mode:
+                state.resizing = True
+                state.resize_mode = mode
+            else:
+                self.moving = True
+        self.update_display()
+
+    def _sync_selection_widgets(self):
+        """Class menu, Delete button and Layers list follow the selected box."""
+        sel = state.selected_bbox
+        valid = sel is not None and 0 <= sel < len(state.bboxes)
+        if hasattr(self, 'class_combo'):
+            self.class_var.set(state.bboxes[sel][4] if valid else '')
+            self.class_combo.config(state='readonly' if valid else 'disabled')
+            self.delete_box_btn.config(state=tk.NORMAL if valid else tk.DISABLED)
+        if hasattr(self, 'layer_listbox'):
+            if len(self._layer_rows) != len(state.bboxes):
+                self.refresh_layers()
+            else:
+                self._select_layer_row()
+
+    def on_box_class_chosen(self, event=None):
+        i = state.selected_bbox
+        if i is None or not 0 <= i < len(state.bboxes):
+            return
+        new_class = self.class_var.get()
+        if not new_class or new_class == state.bboxes[i][4]:
+            return
+        self.push_undo()
+        print(f"[GUI] Changed bbox class: {state.bboxes[i][4]} → {new_class}")
+        state.bboxes[i][4] = new_class
+        self.update_info()
+        self.update_display()
+
+    # -- Layers: the boxes of this image, front (top) to back; a box further down the list is drawn under the
+    # ones above it, and the list order is the order of the lines in the saved label file
+    def refresh_layers(self):
+        if not hasattr(self, 'layer_listbox'):
+            return
+        lb = self.layer_listbox
+        top = lb.yview()[0]
+        lb.delete(0, tk.END)
+        self._layer_rows = list(range(len(state.bboxes) - 1, -1, -1))
+        colors = class_manager.get_colors()
+        for row, i in enumerate(self._layer_rows):
+            cls = state.bboxes[i][4]
+            hidden = not self._box_visible(i)
+            lb.insert(tk.END, f"  {i + 1:>2}.  {cls}" + ("   (hidden)" if hidden else ""))
+            idx = class_manager.get_class_index(cls)
+            if hidden:
+                lb.itemconfig(row, bg=C_CARD, fg=C_TXT3)
+            elif 0 <= idx < len(colors):
+                hex_color = self.rgb_to_hex(colors[idx])
+                lb.itemconfig(row, bg=hex_color, fg=self._readable_fg(hex_color))
+        self.layer_count.config(text=f"{len(state.bboxes)} box{'es' if len(state.bboxes) != 1 else ''}")
+        lb.yview_moveto(top)
+        self._select_layer_row()
+
+    def _select_layer_row(self):
+        lb = self.layer_listbox
+        lb.selection_clear(0, tk.END)
+        sel = state.selected_bbox
+        if sel is not None and sel in self._layer_rows:
+            row = self._layer_rows.index(sel)
+            lb.selection_set(row)
+            lb.see(row)
+
+    def on_layer_select(self, event=None):
+        picked = self.layer_listbox.curselection()
+        if not picked or picked[0] >= len(self._layer_rows):
+            return
+        state.selected_bboxes = set()
+        state.selected_bbox = self._layer_rows[picked[0]]
+        if self.edit_tool != 'select':
+            self.set_edit_tool('select')
+        else:
+            self.update_display()
+
+    def move_layer(self, how):
+        """how: 'front' / 'back' (all the way) or 'forward' / 'backward' (one step)."""
+        i = state.selected_bbox
+        n = len(state.bboxes)
+        if i is None or not 0 <= i < n:
+            return
+        target = {'front': n - 1, 'back': 0, 'forward': min(i + 1, n - 1), 'backward': max(i - 1, 0)}[how]
+        if target == i:
+            return
+        self.push_undo()
+        state.bboxes.insert(target, state.bboxes.pop(i))
+        state.selected_bbox = target
+        self.update_info()
+        self.update_display()
+
+    def on_visibility_changed(self):
+        self.refresh_layers()
+        self.update_display()
 
     # ----------------------------------------------------------
     #  CREATE WIDGETS — main UI construction
@@ -417,8 +629,11 @@ class AnnotationGUI:
         vbtn_row.pack(side=tk.RIGHT, padx=6)
 
         # — Visibility scroll area —
-        vis_canvas = tk.Canvas(left_panel, bg=C_PANEL, highlightthickness=0)
-        vis_scroll = tk.Scrollbar(left_panel, orient="vertical", command=vis_canvas.yview,
+        vis_wrap = tk.Frame(left_panel, bg=C_PANEL, height=150)
+        vis_wrap.pack(fill=tk.X)
+        vis_wrap.pack_propagate(False)
+        vis_canvas = tk.Canvas(vis_wrap, bg=C_PANEL, highlightthickness=0)
+        vis_scroll = tk.Scrollbar(vis_wrap, orient="vertical", command=vis_canvas.yview,
                                    bg=C_BORDER, troughcolor=C_PANEL,
                                    relief=tk.FLAT, width=7)
         self.visibility_frame = tk.Frame(vis_canvas, bg=C_PANEL)
@@ -433,10 +648,82 @@ class AnnotationGUI:
 
         self.refresh_visibility_toggles()
 
+        # — Layers: every box of this image, front to back —
+        tk.Frame(left_panel, bg=C_BORDER, height=1).pack(fill=tk.X)
+        lay_hdr = tk.Frame(left_panel, bg=C_CARD, height=40)
+        lay_hdr.pack(fill=tk.X)
+        lay_hdr.pack_propagate(False)
+        tk.Label(lay_hdr, text="🗂  LAYERS", bg=C_CARD, fg=C_TXT2,
+                 font=('Segoe UI', 8, 'bold')).pack(side=tk.LEFT, padx=10)
+        self.layer_count = tk.Label(lay_hdr, text="", bg=C_CARD, fg=C_TXT3, font=('Segoe UI', 8))
+        self.layer_count.pack(side=tk.RIGHT, padx=10)
+
+        lay_btns = tk.Frame(left_panel, bg=C_PANEL)
+        lay_btns.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=(2, 6))
+        lay_btns.columnconfigure(0, weight=1, uniform='lay')
+        lay_btns.columnconfigure(1, weight=1, uniform='lay')
+        for n, (text, how) in enumerate((("Bring to front", 'front'), ("Send to back", 'back'),
+                                         ("▲  Forward", 'forward'), ("▼  Backward", 'backward'))):
+            self._kbtn(lay_btns, text, lambda h=how: self.move_layer(h), 'secondary').grid(
+                row=n // 2, column=n % 2, sticky='ew', padx=2, pady=2, ipady=2)
+
+        lay_wrap = tk.Frame(left_panel, bg=C_PANEL)
+        lay_wrap.pack(fill=tk.BOTH, expand=True, padx=6, pady=(5, 0))
+        lay_scroll = tk.Scrollbar(lay_wrap, bg=C_BORDER, troughcolor=C_PANEL, relief=tk.FLAT, width=7)
+        lay_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.layer_listbox = tk.Listbox(
+            lay_wrap, bg=C_CARD, fg=C_TXT1, selectmode=tk.SINGLE, font=('Segoe UI', 9),
+            yscrollcommand=lay_scroll.set, height=4, activestyle='none', relief=tk.FLAT,
+            selectbackground=C_ACCENT, selectforeground=C_ON_ACCENT,
+            highlightthickness=0, borderwidth=0, exportselection=False)
+        self.layer_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        lay_scroll.config(command=self.layer_listbox.yview)
+        self.layer_listbox.bind('<<ListboxSelect>>', self.on_layer_select)
+
         # ===== CANVAS AREA =====
         canvas_container = tk.Frame(content, bg=C_STAGE)
         canvas_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.canvas_container = canvas_container  # Store reference for zoom calculations
+
+        # — Tools: draw a box / select (move, resize, relabel) —
+        style = ttk.Style()
+        if style.theme_use() != 'clam':
+            style.theme_use('clam')
+        style.configure('Jelibox.TCombobox', fieldbackground=C_CARD2, background=C_CARD2, foreground=C_TXT1,
+                        selectbackground=C_CARD2, selectforeground=C_TXT1, bordercolor=C_BORDER,
+                        darkcolor=C_CARD2, lightcolor=C_CARD2, arrowcolor=C_ACCENT)
+        style.map('Jelibox.TCombobox', fieldbackground=[('disabled', C_PANEL), ('readonly', C_CARD2)],
+                  foreground=[('disabled', C_TXT3)], selectbackground=[('readonly', C_CARD2)],
+                  selectforeground=[('readonly', C_TXT1)], arrowcolor=[('disabled', C_TXT3)])
+        self.root.option_add('*TCombobox*Listbox.background', C_CARD2)
+        self.root.option_add('*TCombobox*Listbox.foreground', C_TXT1)
+        self.root.option_add('*TCombobox*Listbox.selectBackground', C_ACCENT)
+        self.root.option_add('*TCombobox*Listbox.selectForeground', C_ON_ACCENT)
+
+        tool_bar = tk.Frame(canvas_container, bg=C_PANEL, height=42)
+        tool_bar.pack(side=tk.TOP, fill=tk.X)
+        tool_bar.pack_propagate(False)
+        self.tool_buttons = {}
+        for tool, text in (('draw', "▭  Draw box  (B)"), ('select', "✋  Select  (V)")):
+            btn = tk.Button(tool_bar, text=text, command=lambda t=tool: self.set_edit_tool(t),
+                            font=('Segoe UI', 9, 'bold'), relief=tk.FLAT, cursor='hand2', borderwidth=0,
+                            highlightthickness=1)
+            btn.pack(side=tk.LEFT, padx=(10 if tool == 'draw' else 2, 2), pady=7, ipadx=10)
+            self.tool_buttons[tool] = btn
+        tk.Frame(tool_bar, bg=C_BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y, pady=9, padx=10)
+        tk.Label(tool_bar, text="Class of selected box", bg=C_PANEL, fg=C_TXT3,
+                 font=('Segoe UI', 8, 'bold')).pack(side=tk.LEFT)
+        self.class_var = tk.StringVar()
+        self.class_combo = ttk.Combobox(tool_bar, textvariable=self.class_var, values=CLASSLIST, state='disabled',
+                                        width=22, font=('Segoe UI', 9), style='Jelibox.TCombobox')
+        self.class_combo.pack(side=tk.LEFT, padx=6, pady=8)
+        self.class_combo.bind('<<ComboboxSelected>>', self.on_box_class_chosen)
+        self.delete_box_btn = self._kbtn(tool_bar, "Delete box", self.delete_selected_bbox, 'danger')
+        self.delete_box_btn.config(state=tk.DISABLED, disabledforeground=C_TXT3)
+        self.delete_box_btn.pack(side=tk.LEFT, padx=2, pady=7, ipadx=6)
+        self.tool_hint = tk.Label(tool_bar, text="", bg=C_PANEL, fg=C_TXT3, font=('Segoe UI', 8))
+        self.tool_hint.pack(side=tk.RIGHT, padx=12)
+        tk.Frame(canvas_container, bg=C_BORDER, height=1).pack(fill=tk.X)
 
         self.canvas = tk.Canvas(canvas_container, bg=C_STAGE, highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
@@ -545,14 +832,13 @@ class AnnotationGUI:
         )
         self.statusbar_mode.pack(side=tk.LEFT, padx=(8, 4), pady=4)
 
-        # Force-new-bbox indicator (next to mode pill)
-        self.force_label = tk.Label(
-            status_bar, text="Force: OFF",
-            bg=C_CARD, fg=C_TXT3,
+        # Active edit tool (next to mode pill)
+        self.tool_label = tk.Label(
+            status_bar, text="",
+            bg=C_CARD, fg=C_TXT2,
             font=('Segoe UI', 7, 'bold'), padx=6
         )
-        self.force_label.pack(side=tk.LEFT, padx=(0, 4), pady=4)
-        self.update_force_label()
+        self.tool_label.pack(side=tk.LEFT, padx=(0, 4), pady=4)
 
         tk.Frame(status_bar, bg=C_BORDER, width=1).pack(side=tk.LEFT,
                                                           fill=tk.Y, pady=4)
@@ -576,10 +862,12 @@ class AnnotationGUI:
         # Keyboard hints (right)
         tk.Label(
             status_bar,
-            text="A/D: Navigate  ·  B: BBox  ·  M: Mode  ·  G: Infer  ·  "
+            text="A/D: Navigate  ·  B: Draw  ·  V: Select  ·  M: Mode  ·  G: Infer  ·  "
                  "T: Train  ·  Del: Remove img  ·  Esc: Exit",
             bg=C_PANEL, fg=C_TXT3, font=('Segoe UI', 7)
         ).pack(side=tk.RIGHT, padx=10)
+
+        self.set_edit_tool('draw')
 
     # ----------------------------------------------------------
     #  Class list refresh
@@ -601,6 +889,8 @@ class AnnotationGUI:
             self.class_listbox.select_set(0)
             state.current_class = CLASSLIST[0]
             print(f"[GUI] Loaded {len(CLASSLIST)} classes")
+        if hasattr(self, 'class_combo'):
+            self.class_combo.config(values=CLASSLIST)
 
     # ----------------------------------------------------------
     #  Visibility toggles refresh
@@ -623,7 +913,7 @@ class AnnotationGUI:
                 bg=C_PANEL, fg=C_TXT1,
                 selectcolor=C_CARD2,
                 font=('Segoe UI', 9),
-                command=self.update_display,
+                command=self.on_visibility_changed,
                 activebackground=C_PANEL, activeforeground=C_TXT1
             )
             cb.pack(side=tk.LEFT, padx=2, fill=tk.X, expand=True)
@@ -635,6 +925,7 @@ class AnnotationGUI:
 
         state.visible_class = {cls: var.get() for cls, var in self.visibility_vars.items()}
         self.update_visibility_counts()
+        self.refresh_layers()
 
     def update_visibility_counts(self):
         counts = {cls: 0 for cls in CLASSLIST}
@@ -1688,7 +1979,7 @@ class AnnotationGUI:
             y2_disp = int(y2 * state.display_scale)
             self.draw_bbox_outline(img_array, x1_disp, y1_disp, x2_disp, y2_disp, color_rgb)
 
-            if i == state.selected_bbox:
+            if i == state.selected_bbox and self.edit_tool == 'select':
                 self.draw_bbox_handles(img_array, x1_disp, y1_disp, x2_disp, y2_disp)
 
             label = cls
@@ -1749,53 +2040,20 @@ class AnnotationGUI:
                 img_array, mask_pts, current_mouse_pos=self.hover_pos,
                 color=(255, 100, 100))
 
-        # Force bbox indicator
-        if state.force_new_bbox:
-            h, w = img_array.shape[:2]
-            cv2.rectangle(img_array, (5, 5), (w - 5, h - 5), (200, 60, 60), 3)
-
         img_with_boxes = Image.fromarray(img_array)
         self.photo = ImageTk.PhotoImage(img_with_boxes)
         self.canvas.delete("all")
         self.canvas.create_image(self.canvas_offset_x, self.canvas_offset_y,
                                   anchor=tk.NW, image=self.photo)
-
-        # self.img_label.config(
-        #     text=f"{state.current_index + 1} / {len(self.images)}")
+        self._sync_selection_widgets()
 
     def draw_bbox_handles(self, img_array, x1, y1, x2, y2):
-        """Draw a clear resize affordance around the selected bounding box."""
-        handle_size = max(6, min(10, int(9 * max(state.display_scale, 0.5))))
-        edge_color = (255, 255, 255)
-        accent_color = (0, 212, 255)
-
-        # Contrast outline makes the editable edge visible over any image.
+        """The selected box: a bright outline and a white dot on each corner (drag one to resize)."""
         cv2.rectangle(img_array, (x1, y1), (x2, y2), (0, 0, 0), 5)
-        cv2.rectangle(img_array, (x1, y1), (x2, y2), accent_color, 2)
-
-        handles = [
-            (x1, y1, 'corner'), ((x1 + x2) // 2, y1, 'edge'), (x2, y1, 'corner'),
-            (x2, (y1 + y2) // 2, 'edge'), (x2, y2, 'corner'),
-            ((x1 + x2) // 2, y2, 'edge'), (x1, y2, 'corner'),
-            (x1, (y1 + y2) // 2, 'edge')
-        ]
-        for hx, hy, handle_type in handles:
-            if handle_type == 'corner':
-                cv2.rectangle(
-                    img_array,
-                    (hx - handle_size, hy - handle_size),
-                    (hx + handle_size, hy + handle_size),
-                    edge_color, -1
-                )
-                cv2.rectangle(
-                    img_array,
-                    (hx - handle_size, hy - handle_size),
-                    (hx + handle_size, hy + handle_size),
-                    accent_color, 2
-                )
-            else:
-                cv2.circle(img_array, (hx, hy), handle_size - 1, edge_color, -1)
-                cv2.circle(img_array, (hx, hy), handle_size - 1, accent_color, 2)
+        cv2.rectangle(img_array, (x1, y1), (x2, y2), (0, 212, 255), 2)
+        for hx, hy in ((x1, y1), (x2, y1), (x1, y2), (x2, y2)):
+            cv2.circle(img_array, (hx, hy), self.HANDLE_R + 2, (40, 40, 40), -1, cv2.LINE_AA)
+            cv2.circle(img_array, (hx, hy), self.HANDLE_R, (255, 255, 255), -1, cv2.LINE_AA)
 
     def draw_bbox_outline(self, img_array, x1, y1, x2, y2, color):
         """Draw an outlined bbox with lightweight corner accents."""
@@ -1900,6 +2158,7 @@ class AnnotationGUI:
 
         if hasattr(self, 'visibility_count_labels'):
             self.update_visibility_counts()
+        self.refresh_layers()
 
         # Update bottom status bar progress
         if hasattr(self, 'statusbar_progress'):
@@ -2003,69 +2262,16 @@ class AnnotationGUI:
                 self.shift_start_x, self.shift_start_y = x, y
                 return
 
-            # Klik biasa → clear multi-select
-            state.selected_bboxes = set()
-            state.selected_bbox = None
-            state.resizing = False
-            state.resize_mode = None
-
-            if state.force_new_bbox:
+            if self.edit_tool == 'draw':
+                state.selected_bboxes = set()
                 state.selected_bbox = None
+                state.resizing = False
+                state.resize_mode = None
                 self.drawing = True
                 self.start_x, self.start_y = x, y
                 return
 
-            # Convert display coordinates to original coordinates for collision detection
-            x_orig = x / state.display_scale
-            y_orig = y / state.display_scale
-            clicked = []
-            for i, (x1, y1, x2, y2, cls) in enumerate(state.bboxes):
-                if x1 <= x_orig <= x2 and y1 <= y_orig <= y2:
-                    area = (x2 - x1) * (y2 - y1)
-                    clicked.append((area, i))
-
-            if clicked:
-                _, state.selected_bbox = min(clicked, key=lambda a: a[0])
-                x1, y1, x2, y2, _ = state.bboxes[state.selected_bbox]
-                # Convert to display coordinates for handle detection
-                x1_disp = int(x1 * state.display_scale)
-                y1_disp = int(y1 * state.display_scale)
-                x2_disp = int(x2 * state.display_scale)
-                y2_disp = int(y2 * state.display_scale)
-                handle_size = max(12, int(12 * max(state.display_scale, 0.5)))
-                mid_x = (x1_disp + x2_disp) // 2
-                mid_y = (y1_disp + y2_disp) // 2
-                if abs(x - x1_disp) < handle_size and abs(y - y1_disp) < handle_size:
-                    state.resizing = True
-                    state.resize_mode = 'tl'
-                elif abs(x - mid_x) < handle_size and abs(y - y1_disp) < handle_size:
-                    state.resizing = True
-                    state.resize_mode = 't'
-                elif abs(x - x2_disp) < handle_size and abs(y - y1_disp) < handle_size:
-                    state.resizing = True
-                    state.resize_mode = 'tr'
-                elif abs(x - x2_disp) < handle_size and abs(y - mid_y) < handle_size:
-                    state.resizing = True
-                    state.resize_mode = 'r'
-                elif abs(x - x1_disp) < handle_size and abs(y - y2_disp) < handle_size:
-                    state.resizing = True
-                    state.resize_mode = 'bl'
-                elif abs(x - mid_x) < handle_size and abs(y - y2_disp) < handle_size:
-                    state.resizing = True
-                    state.resize_mode = 'b'
-                elif abs(x - x2_disp) < handle_size and abs(y - y2_disp) < handle_size:
-                    state.resizing = True
-                    state.resize_mode = 'br'
-                elif abs(x - x1_disp) < handle_size and abs(y - mid_y) < handle_size:
-                    state.resizing = True
-                    state.resize_mode = 'l'
-                else:
-                    self.moving = True
-                self.update_display()
-                return
-
-            self.drawing = True
-            self.start_x, self.start_y = x, y
+            self._begin_select_drag(x, y)
 
     def draw_dashed_line(self, img_array, pt1, pt2, color, dash_length=6, gap_length=4, thickness=1):
         """Draw dashed line on image array"""
@@ -2175,45 +2381,33 @@ class AnnotationGUI:
             self.canvas.create_image(self.canvas_offset_x, self.canvas_offset_y,
                                       anchor=tk.NW, image=self.photo)
 
-        elif self.moving and state.selected_bbox is not None:
-            # Convert display delta to original scale delta
-            dx = (x - state.ix) / state.display_scale
-            dy = (y - state.iy) / state.display_scale
+        elif self.moving and state.selected_bbox is not None and self._drag_origin:
+            ox, oy, (bx1, by1, bx2, by2) = self._drag_origin
+            dx = x / state.display_scale - ox
+            dy = y / state.display_scale - oy
+            w, h = bx2 - bx1, by2 - by1
+            nx1 = min(max(bx1 + dx, 0), max(state.orig_width - w, 0))
+            ny1 = min(max(by1 + dy, 0), max(state.orig_height - h, 0))
             self.push_undo_once_per_drag()
-            state.bboxes[state.selected_bbox][0] += dx
-            state.bboxes[state.selected_bbox][1] += dy
-            state.bboxes[state.selected_bbox][2] += dx
-            state.bboxes[state.selected_bbox][3] += dy
-            state.ix, state.iy = x, y
+            box = state.bboxes[state.selected_bbox]
+            box[0], box[1], box[2], box[3] = nx1, ny1, nx1 + w, ny1 + h
             self.update_display()
 
         elif state.resizing and state.selected_bbox is not None:
-            # Convert display coordinates to original coordinates
-            x_orig = x / state.display_scale
-            y_orig = y / state.display_scale
+            x_orig = min(max(x / state.display_scale, 0), state.orig_width)
+            y_orig = min(max(y / state.display_scale, 0), state.orig_height)
             self.push_undo_once_per_drag()
-            x1, y1, x2, y2, cls = state.bboxes[state.selected_bbox]
+            box = state.bboxes[state.selected_bbox]
             min_size = 5 / state.display_scale  # Minimum size in original coordinates
-            if state.resize_mode == 'tl':
-                state.bboxes[state.selected_bbox][0] = min(x_orig, x2 - min_size)
-                state.bboxes[state.selected_bbox][1] = min(y_orig, y2 - min_size)
-            elif state.resize_mode == 't':
-                state.bboxes[state.selected_bbox][1] = min(y_orig, y2 - min_size)
-            elif state.resize_mode == 'tr':
-                state.bboxes[state.selected_bbox][2] = max(x_orig, x1 + min_size)
-                state.bboxes[state.selected_bbox][1] = min(y_orig, y2 - min_size)
-            elif state.resize_mode == 'r':
-                state.bboxes[state.selected_bbox][2] = max(x_orig, x1 + min_size)
-            elif state.resize_mode == 'bl':
-                state.bboxes[state.selected_bbox][0] = min(x_orig, x2 - min_size)
-                state.bboxes[state.selected_bbox][3] = max(y_orig, y1 + min_size)
-            elif state.resize_mode == 'b':
-                state.bboxes[state.selected_bbox][3] = max(y_orig, y1 + min_size)
-            elif state.resize_mode == 'br':
-                state.bboxes[state.selected_bbox][2] = max(x_orig, x1 + min_size)
-                state.bboxes[state.selected_bbox][3] = max(y_orig, y1 + min_size)
-            elif state.resize_mode == 'l':
-                state.bboxes[state.selected_bbox][0] = min(x_orig, x2 - min_size)
+            mode = state.resize_mode
+            if 'l' in mode:
+                box[0] = min(x_orig, box[2] - min_size)
+            if 'r' in mode:
+                box[2] = max(x_orig, box[0] + min_size)
+            if 't' in mode:
+                box[1] = min(y_orig, box[3] - min_size)
+            if 'b' in mode:
+                box[3] = max(y_orig, box[1] + min_size)
             self.update_display()
 
     def on_mouse_up(self, event):
@@ -2295,9 +2489,8 @@ class AnnotationGUI:
         self.moving = False
         state.resizing = False
         self._drag_pushed = False
-        state.force_new_bbox = False
+        self._drag_origin = None
         self.update_display()
-        self.update_force_label()
 
     def on_mouse_move(self, event):
         """Show crosshair when hovering over canvas (not drawing)"""
@@ -2313,6 +2506,11 @@ class AnnotationGUI:
         # full scene so the line from the last point follows the cursor.
         if state.polygon_points_preview or self.mask_polygon_points:
             self.update_display()
+            return
+
+        if state.annotation_mode == "bbox" and self.edit_tool == 'select':
+            if not self.moving and not state.resizing:
+                self._update_hover_cursor(x, y)
             return
 
         # Only show crosshair if not drawing/moving/resizing and in bbox mode
@@ -2667,6 +2865,7 @@ class AnnotationGUI:
                                 "Press B to create a bounding box.")
             self.cancel_polygon_drawing()
 
+        self._set_cursor('')
         self.update_display()
         self.update_info()
 

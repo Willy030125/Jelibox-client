@@ -1,9 +1,12 @@
 """
-Custom-trained dual-head YOLO models: a frozen Ultralytics detector plus a small RoI head you trained.
+Custom-trained multi-head YOLO models: a frozen Ultralytics detector plus a small head you trained.
 
-The detector is the stock pretrained model and is never updated. It finds boxes of the class(es) you choose
-(COCO: person = 0, bottle = 39, ...). The head looks at the SAME neck features inside each box and gives the box
-your own class - a behavior ("sleeping", "working") or a product ("CocaCola", "Fanta", "Sprite").
+The detector is the stock pretrained model and is never updated. A head is one of two kinds:
+  classify - the detector finds boxes of the class(es) you choose (COCO: person = 0, bottle = 39, ...) and the head
+             looks at the SAME neck features inside each box and gives it your own class: a behavior ("sleeping",
+             "working") or a product ("CocaCola", "Fanta", "Sprite").
+  detect   - the head finds its own boxes and classes (a phone in use, an open bottle cap), centre-based, on the
+             stride-8 neck features. For things the detector's 80 classes can't see.
 
 Ported from TOBEADDED/custom_dual_heads (model.py, dataset.py letterbox, infer.py). Differences: the detector
 classes are a setting instead of always being person, results come back in the original image's pixels, end-to-end
@@ -17,6 +20,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision.ops import roi_align
 
 MIN_ULTRALYTICS = (8, 4, 68)
@@ -180,21 +184,79 @@ class BehaviorHead(nn.Module):
         return self.fc(torch.cat([x, g.to(x.dtype)], 1))
 
 
-class BehaviorModel(nn.Module):
-    def __init__(self, weights, num_classes, taps=(15, 18, 21), strides=(8, 16, 32), **head_kw):
-        super().__init__()
-        self.backbone = FrozenYOLO(weights, taps)
-        self.head = BehaviorHead(self.backbone.channels, num_classes, strides, **head_kw)
+def _conv_block(i, o, k):
+    return nn.Sequential(nn.Conv2d(i, o, k, padding=k // 2, bias=False), nn.GroupNorm(32, o), nn.SiLU())
 
-    def forward(self, imgs, bidx, boxes):
+
+class DetectHead(nn.Module):
+    """Centre-based detector on the neck features. Raw output: heat (B, nc, h, w) logits, size (B, 2, h, w) =
+    log(w / stride, h / stride), off (B, 2, h, w) logits of the centre's position inside its cell."""
+
+    def __init__(self, in_chs, num_classes, strides=(8, 16, 32), c=128):
+        super().__init__()
+        self.stride = strides[0]
+        self.proj = nn.ModuleList([_conv_block(ch, c, 1) for ch in in_chs])
+        self.fuse = nn.Sequential(_conv_block(c, c, 3), _conv_block(c, c, 3))
+        self.heat = nn.Conv2d(c, num_classes, 1)
+        self.size = nn.Conv2d(c, 2, 1)
+        self.off = nn.Conv2d(c, 2, 1)
+        nn.init.constant_(self.heat.bias, -2.19)           # prior p = 0.1: stable start for the focal loss
+
+    def forward(self, feats):
+        x = self.proj[0](feats[0])
+        for l in range(1, len(feats)):
+            x = x + F.interpolate(self.proj[l](feats[l]), size=x.shape[-2:], mode="nearest")
+        x = self.fuse(x)
+        return dict(heat=self.heat(x), size=self.size(x), off=self.off(x))
+
+
+@torch.no_grad()
+def decode(out, stride, conf=0.3, max_det=300):
+    """Per image (boxes xyxy in letterboxed pixels (N, 4), scores (N,), classes (N,)), best score first."""
+    heat = out["heat"].float().sigmoid()
+    heat = heat * ((F.max_pool2d(heat, 3, 1, 1) == heat) & (heat >= conf))        # local maxima only
+    B, _, gh, gw = heat.shape
+    res = []
+    for b in range(B):
+        sc, idx = heat[b].flatten().topk(min(max_det, heat[b].numel()))
+        keep = sc >= conf
+        sc, idx = sc[keep], idx[keep]
+        cls, rem = idx // (gh * gw), idx % (gh * gw)
+        iy, ix = rem // gw, rem % gw
+        off = out["off"][b].float().sigmoid()
+        size = out["size"][b].float().clamp(-6, 6).exp() * stride
+        cx, cy = (ix + off[0, iy, ix]) * stride, (iy + off[1, iy, ix]) * stride
+        w, h = size[0, iy, ix], size[1, iy, ix]
+        res.append((torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], 1), sc, cls))
+    return res
+
+
+class BehaviorModel(nn.Module):
+    """Frozen detector + one head. kind 'classify': forward(imgs, bidx, boxes) -> logits per box;
+    kind 'detect': forward(imgs) -> the DetectHead's raw output."""
+
+    def __init__(self, weights, num_classes, taps=(15, 18, 21), strides=(8, 16, 32), kind="classify", **head_kw):
+        super().__init__()
+        self.kind = kind
+        self.backbone = FrozenYOLO(weights, taps)
+        head = DetectHead if kind == "detect" else BehaviorHead
+        self.head = head(self.backbone.channels, num_classes, strides, **head_kw)
+
+    def forward(self, imgs, bidx=None, boxes=None):
         _, feats = self.backbone(imgs)
+        if self.kind == "detect":
+            return self.head(feats)
         return self.head(feats, bidx, boxes, imgs.shape[-2:])
 
 
 # ------------------------------------------------------------------ checkpoint
+HEAD_KINDS = ("classify", "detect")
+
+
 def read_checkpoint(path):
-    """Load and validate a head checkpoint written by train.py. Returns the dict
-    {'head': state_dict, 'names': [...], 'cfg': {'weights', 'taps', 'imgsz', 'nc'}}."""
+    """Load and validate a head checkpoint written by train.py or by the Train button. Returns the dict
+    {'head': state_dict, 'names': [...], 'cfg': {'weights', 'taps', 'imgsz', 'strides', 'nc'}, 'kind': 'classify' or
+    'detect'}. Older checkpoints (no 'spec', no 'strides') are classify heads on strides 8 / 16 / 32."""
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Head checkpoint not found: {path}")
     try:
@@ -203,11 +265,17 @@ def read_checkpoint(path):
         raise ValueError(f"{os.path.basename(path)} is not a head checkpoint Jelibox can read: {exc}") from exc
     cfg = ck.get("cfg") if isinstance(ck, dict) else None
     ok = (isinstance(ck, dict) and "head" in ck and isinstance(ck.get("names"), (list, tuple)) and isinstance(cfg, dict)
-          and all(k in cfg for k in ("weights", "taps", "imgsz", "nc")))
+          and all(k in cfg for k in ("weights", "taps", "imgsz")))
     if not ok:
-        raise ValueError(f"{os.path.basename(path)} is missing head / names / cfg (weights, taps, imgsz, nc) - "
+        raise ValueError(f"{os.path.basename(path)} is missing head / names / cfg (weights, taps, imgsz) - "
                          f"was it saved by train.py?")
     ck["names"] = [str(n) for n in ck["names"]]
+    spec = ck.get("spec")
+    ck["kind"] = spec.get("type", "classify") if isinstance(spec, dict) else "classify"
+    if ck["kind"] not in HEAD_KINDS:
+        raise ValueError(f"{os.path.basename(path)} has an unknown head type {ck['kind']!r}.")
+    cfg.setdefault("nc", len(ck["names"]))
+    cfg.setdefault("strides", [8, 16, 32])
     return ck
 
 
@@ -221,6 +289,7 @@ class HeadDetector:
         ck = read_checkpoint(head_path)
         cfg = ck["cfg"]
         self.names = ck["names"]
+        self.kind = ck["kind"]
         self.imgsz = tuple(int(v) for v in cfg["imgsz"])
         self.device = torch.device("cuda" if (device == "cuda" or (device == "auto" and torch.cuda.is_available()))
                                    else "cpu")
@@ -228,7 +297,8 @@ class HeadDetector:
         if detectors_dir and not os.path.isabs(weights) and not os.path.exists(weights):
             os.makedirs(detectors_dir, exist_ok=True)       # ultralytics downloads a missing file to this path
             weights = os.path.join(detectors_dir, os.path.basename(weights))
-        self.model = BehaviorModel(weights, int(cfg["nc"]), taps=tuple(cfg["taps"])).to(self.device)
+        self.model = BehaviorModel(weights, int(cfg["nc"]), taps=tuple(cfg["taps"]), strides=tuple(cfg["strides"]),
+                                   kind=self.kind).to(self.device)
         self.model.head.load_state_dict(ck["head"])
         self.model.eval()
         self.detector_names = self.model.backbone.det_names
@@ -248,29 +318,36 @@ class HeadDetector:
     @torch.no_grad()
     def predict(self, frame_bgr, conf=0.3, iou=0.6, classes=(0,), min_head_conf=0.0):
         """frame_bgr: HxWx3 uint8. Returns [{'rect': (x1,y1,x2,y2) ints in the original image, 'det_conf',
-        'head': class name, 'head_conf'}], most confident box first."""
+        'head': class name, 'head_conf'}], most confident box first. classify head: conf / iou / classes configure the
+        detector whose boxes get a class. detect head: conf is the score threshold; iou and classes are not used and
+        det_conf is the head's own score."""
         H, W = self.imgsz
         h0, w0 = frame_bgr.shape[:2]
         img, r, left, top = letterbox(frame_bgr, (H, W))
         x = torch.from_numpy(img[:, :, ::-1].copy()).permute(2, 0, 1)[None].to(self.device).float() / 255
         with torch.autocast(self.device.type, enabled=self.device.type == "cuda"):
             out, feats = self.model.backbone(x)
-            det = self._detections(out, conf, iou, list(classes) if classes else None)
-            if not len(det):
-                return []
-            boxes = det[:, :4].float()
-            logits = self.model.head(feats, torch.zeros(len(boxes), dtype=torch.long, device=self.device),
-                                     boxes, (H, W))
-        probs = logits.float().softmax(1).cpu()
+            if self.kind == "detect":
+                boxes, scores, ids = decode(self.model.head(feats), self.model.head.stride, conf)[0]
+                found = [(b, s, s, int(k)) for b, s, k in zip(boxes.cpu().tolist(), scores.cpu().tolist(), ids.cpu())]
+            else:
+                det = self._detections(out, conf, iou, list(classes) if classes else None)
+                if not len(det):
+                    return []
+                boxes = det[:, :4].float()
+                logits = self.model.head(feats, torch.zeros(len(boxes), dtype=torch.long, device=self.device),
+                                         boxes, (H, W))
+                probs = logits.float().softmax(1).cpu()
+                found = [(b, d, float(p.max()), int(p.argmax()))
+                         for b, d, p in zip(boxes.cpu().tolist(), det[:, 4].cpu().tolist(), probs)]
         results = []
-        for box, det_conf, p in zip(boxes.cpu().tolist(), det[:, 4].cpu().tolist(), probs):
-            k = int(p.argmax())
-            if float(p[k]) < min_head_conf:
+        for box, det_conf, head_conf, k in found:
+            if head_conf < min_head_conf:
                 continue
             rect = unletterbox(box, r, left, top, w0, h0)
             if rect[2] - rect[0] < 2 or rect[3] - rect[1] < 2:
                 continue
             results.append({"rect": rect, "det_conf": float(det_conf), "head": self.names[k],
-                            "head_conf": float(p[k])})
+                            "head_conf": float(head_conf)})
         results.sort(key=lambda d: d["det_conf"], reverse=True)
         return results

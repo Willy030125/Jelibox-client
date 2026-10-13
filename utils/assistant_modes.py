@@ -3,8 +3,8 @@ The three ways Jelibox can annotate for you, picked on the front menu of the wor
 
   - YOLO-World       : the original Jelibox - zero-shot text prompts, or the model you trained here
   - LocateAnything   : nvidia/LocateAnything-3B (HF Transformers), a vision-language model
-  - Custom head      : a frozen YOLO detector (e.g. COCO "person" or "bottle" boxes) plus a head you trained
-                       that gives every box your own class (behavior, brand, ...)
+  - Custom head      : a frozen YOLO detector draws the boxes, heads you trained give every box your own class
+                       (classify) or find objects of their own (detect); any task, not one fixed case
 
 The chosen mode is app-wide (configs/_app.json); the settings of each mode are per workspace
 (configs/<workspace>.json, see workspace_config.py). Dependency-free on purpose: the picker imports it
@@ -28,9 +28,9 @@ MODES = [
      "NVIDIA LocateAnything-3B. Labels a whole folder from a list of categories, in English or Chinese.",
      "About 7 GB download on first use. Needs a GPU with 8 GB+ or about 10 GB of free RAM."),
     (MODE_HEAD, "Custom head",
-     "A YOLO detector finds the boxes (person, bottle, ...), your trained head names each one "
-     "(sleeping / working, Coca-Cola / Fanta / Sprite, ...).",
-     "Needs a head checkpoint you trained (head_best.pt)."),
+     "Build your own labeler on top of a YOLO detector. The detector draws the boxes; heads you train give each "
+     "box your own class, or find extra objects the detector has no class for. One head per task, for any case.",
+     "The detector alone already draws boxes to start from. A head you trained (head_best.pt) adds your classes."),
 ]
 
 _TITLES = {m[0]: m[1] for m in MODES}

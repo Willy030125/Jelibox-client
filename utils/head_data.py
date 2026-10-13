@@ -77,15 +77,17 @@ def read_label_rows(path):
     return rows
 
 
-def labelled_pairs(images_folders, labels_dir):
-    """[(image path, label path)] of the images that have at least one label row, in natural name order."""
+def labelled_pairs(images_folders, labels_dir, allow_empty=False):
+    """[(image path, label path)] of the images that have at least one label row, in natural name order.
+    allow_empty: also keep images whose label file exists but has no rows - for a detect head that means "nothing
+    to find here" and is training data; a classify head has nothing to learn from such an image."""
     images = index_images(images_folders)
     pairs = []
     if os.path.isdir(labels_dir):
         for name in os.listdir(labels_dir):
             base, ext = os.path.splitext(name)
             path = os.path.join(labels_dir, name)
-            if ext.lower() == ".txt" and base in images and read_label_rows(path):
+            if ext.lower() == ".txt" and base in images and (allow_empty or read_label_rows(path)):
                 pairs.append((images[base], path))
     pairs.sort(key=lambda p: _natural(os.path.basename(p[0])))
     return pairs

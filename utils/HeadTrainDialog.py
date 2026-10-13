@@ -1,7 +1,7 @@
 """
 The Train button of the Custom head mode: train a head on the labels of this workspace.
 
-Setup window (detector, taps, image size, epochs ...) -> the same window turns into a progress window while
+Setup window (head type, detector, taps, image size, epochs ...) -> the same window turns into a progress window while
 `utils/head_train.py` runs as a separate process -> on success the head is saved as models/<workspace>/head_best.pt
 and selected in Label Assistant, so G and Auto-annotate all use it right away.
 
@@ -17,6 +17,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 from . import head_data
+from . import head_export
 from . import workspace_config as wcfg
 from .ModeDialogs import _Dialog
 from .config import workspaceName, BASE_DIR
@@ -37,8 +38,9 @@ def default_command(job_path):
 
 
 def build_job(*, images_folders, labels_folder, classes, weights, taps, imgsz, epochs, batch, lr, class_weights,
-              hflip, val_fraction, out_dir, base_dir=BASE_DIR, workers=2):
+              hflip, val_fraction, out_dir, base_dir=BASE_DIR, workers=2, head_type="classify", anchors=(), head_name=""):
     return {
+        "head_type": head_type, "anchors": list(anchors), "head_name": head_name,
         "images_folders": list(images_folders), "labels_folder": labels_folder, "classes": list(classes),
         "weights": weights, "detectors_dir": os.path.join(base_dir, "models", "_detectors"),
         "taps": list(taps), "imgsz": list(imgsz), "epochs": int(epochs), "batch": int(batch), "lr": float(lr),
@@ -161,6 +163,7 @@ class HeadTrainDialog(_Dialog):
         self.result = None
         self.error = None
         self.pairs = head_data.labelled_pairs(self.images_folders, self.labels_folder)
+        self.pairs_with_empty = head_data.labelled_pairs(self.images_folders, self.labels_folder, allow_empty=True)
         super().__init__(parent)
         self.win.title("Train head")
         self.win.bind('<Escape>', lambda e: self._close())
@@ -169,9 +172,24 @@ class HeadTrainDialog(_Dialog):
     # ---------------------------------------------------------- setup view
     def build(self, body):
         h = self.cfg["custom_head"]
-        self.label(body, "Trains a head on this workspace's labels: the box is what the detector finds (a person, a "
-                         "bottle ...) and its class is what the head learns (a behavior, a brand ...). The detector "
-                         "itself is never changed.", pady=(0, 8))
+        self.label(body, "Trains a head on this workspace's labels. The detector itself is never changed.", pady=(0, 8))
+
+        card = self.card(body)
+        self.label(card, "HEAD TYPE", size=8, bold=True)
+        self.kind_var = tk.StringVar(value="classify")
+        for value, text, hint in (
+                ("classify", "Classify boxes the detector finds",
+                 "The box is a person, a bottle ... that the detector finds; the head learns its class (a behavior, a "
+                 "brand ...). Label it with the detector's box and your class."),
+                ("detect", "Detect objects of my own",
+                 "The head learns the boxes too: a phone in use, an open cap ... Draw those boxes yourself. An image you "
+                 "visited with no boxes teaches the head that nothing is there. \"Detect these classes\" of Label "
+                 "Assistant is saved with the head as the detector boxes its detections belong to (used by train.py).")):
+            tk.Radiobutton(card, text=text, value=value, variable=self.kind_var, bg=C_CARD, fg=C_TXT1, selectcolor=C_BASE,
+                           activebackground=C_CARD, activeforeground=C_ACCENT, font=('Segoe UI', 9), bd=0,
+                           highlightthickness=0, cursor='hand2', anchor='w').pack(fill=tk.X, pady=(4, 0))
+            self.label(card, hint, size=8, fg=C_TXT3, pady=(0, 0))
+        self.kind_var.trace_add("write", lambda *_: self._kind_changed())
 
         card = self.card(body)
         self.label(card, "DATA", size=8, bold=True)
@@ -187,6 +205,10 @@ class HeadTrainDialog(_Dialog):
         self.label(card, "The split is by position, not random: video frames are near-duplicates, and a random split "
                          "would score the head on pictures it has practically seen.", size=8, fg=C_TXT3, pady=(4, 0))
         self.classes_note = self.label(card, "", size=8, fg=C_AMBER, pady=(2, 0))
+        self.button(card, "Export for training on another PC ...", self._export).pack(anchor='w', pady=(8, 0), ipadx=8, ipady=3)
+        self.label(card, "Copies the images and labels of this head, split as above, with a ready config for the "
+                         "command-line trainer's train.py (for example on a computer with a GPU).",
+                   size=8, fg=C_TXT3, pady=(2, 0))
         self._update_data_info()
 
         card = self.card(body)
@@ -219,6 +241,7 @@ class HeadTrainDialog(_Dialog):
         self.epochs_var, self.batch_var = tk.IntVar(value=50), tk.IntVar(value=16)
         self.lr_var = tk.StringVar(value="0.001")
         self.cw_var, self.flip_var = tk.BooleanVar(value=True), tk.BooleanVar(value=True)
+        self.cw_check = None
 
         def row_label(r, text):
             tk.Label(grid, text=text, bg=C_CARD, fg=C_TXT2, font=('Segoe UI', 9), width=28, anchor='w'
@@ -237,8 +260,8 @@ class HeadTrainDialog(_Dialog):
         self.spin(grid, self.batch_var, 1, 128).grid(row=2, column=1, sticky='w')
         row_label(3, "Learning rate")
         self.entry(grid, self.lr_var, 10).grid(row=3, column=1, sticky='w', ipady=3)
-        self.check(grid, "Class weights (rare classes count more)", self.cw_var).grid(
-            row=4, column=0, columnspan=2, sticky='w', pady=(4, 0))
+        self.cw_check = self.check(grid, "Class weights (rare classes count more)", self.cw_var)
+        self.cw_check.grid(row=4, column=0, columnspan=2, sticky='w', pady=(4, 0))
         self.check(grid, "Flip images horizontally (turn off when logos or text matter)", self.flip_var).grid(
             row=5, column=0, columnspan=2, sticky='w')
         self.label(card, "COCO detectors are trained on 640×640 squares, but the head reads features at any size. A "
@@ -267,27 +290,76 @@ class HeadTrainDialog(_Dialog):
             self.device_hint.config(text="No NVIDIA GPU is available to PyTorch here, so training runs on the CPU: "
                                          "expect minutes per epoch. Try fewer epochs first.")
 
+    def _kind_changed(self):
+        detect = self.kind_var.get() == "detect"
+        self.cw_check.config(state=tk.DISABLED if detect else tk.NORMAL)
+        self._update_data_info()
+
+    def _current_pairs(self):
+        return self.pairs_with_empty if self.kind_var.get() == "detect" else self.pairs
+
+    def _boxed(self):
+        """Images that have boxes (a detect head also counts empty ones as training data, but needs some boxes)."""
+        return sum(1 for _, label in self.pairs_with_empty if head_data.read_label_rows(label)) \
+            if self.kind_var.get() == "detect" else len(self.pairs)
+
     def _update_data_info(self):
-        n = len(self.pairs)
+        pairs = self._current_pairs()
+        n = len(pairs)
         try:
             share = max(5, min(50, int(self.val_var.get())))
         except (tk.TclError, ValueError):
             share = 20
+        detect = self.kind_var.get() == "detect"
+        noun = "images (with and without boxes)" if detect else "labelled images"
         if n >= 2:
-            train, val = head_data.split_contiguous(self.pairs, share / 100)
-            text = f"{n} labelled images: {len(train)} to train, {len(val)} to validate."
+            train, val = head_data.split_contiguous(pairs, share / 100)
+            text = f"{n} {noun}: {len(train)} to train, {len(val)} to validate."
         else:
-            text = f"{n} labelled images."
-        counts = head_data.class_counts(self.pairs, len(self.classes))
+            text = f"{n} {noun}."
+        counts = head_data.class_counts(pairs, len(self.classes))
         used = [f"{c} {k}" for c, k in zip(self.classes, counts) if k]
         self.data_info.config(text=text + ("\nBoxes per class: " + ", ".join(used) if used else ""))
         notes = []
-        if n < head_data.MIN_LABELLED:
-            notes.append(f"At least {head_data.MIN_LABELLED} labelled images are needed.")
+        if self._boxed() < head_data.MIN_LABELLED:
+            notes.append(f"At least {head_data.MIN_LABELLED} images with boxes are needed.")
         unused = [c for c, k in zip(self.classes, counts) if not k]
         if unused and used:
             notes.append("No examples yet for: " + ", ".join(unused) + " (the head will not learn them).")
         self.classes_note.config(text="  ".join(notes))
+
+    def _export(self):
+        st = self._settings()
+        if st is None:
+            return
+        if self._boxed() < head_data.MIN_LABELLED:
+            messagebox.showwarning("Export", f"Only {self._boxed()} images have boxes. At least "
+                                             f"{head_data.MIN_LABELLED} are needed.", parent=self.win)
+            return
+        folder = filedialog.askdirectory(parent=self.win, title="Export to which folder? (a new folder is made inside)",
+                                         initialdir=os.path.dirname(BASE_DIR))
+        if not folder:
+            return
+        out_dir = os.path.join(folder, head_export.safe_name(workspaceName) + "_head_dataset")
+        detect = self.kind_var.get() == "detect"
+        self.win.config(cursor='watch')
+        self.win.update_idletasks()
+        try:
+            info = head_export.export_for_trainer(
+                self._current_pairs(), out_dir, head_name=workspaceName, head_type=self.kind_var.get(),
+                classes=self.classes, anchors=self.cfg["custom_head"]["detector_classes"], weights=st["weights"],
+                taps=st["taps"], imgsz=st["imgsz"], epochs=st["epochs"], batch=st["batch"], lr=st["lr"],
+                val_fraction=st["share"] / 100, flip=self.flip_var.get())
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Export", f"The export failed:\n{exc}", parent=self.win)
+            return
+        finally:
+            self.win.config(cursor='')
+        messagebox.showinfo(
+            "Export", f"{info['train']} images to train and {info['val']} to validate were written to\n{out_dir}\n\n"
+                      f"On the other computer, with the command-line trainer's files, from inside that folder:\n"
+                      f"{info['command']}\n\nThe detector ({os.path.basename(st['weights'])}) is downloaded there on first use. "
+                      f"Copy the resulting head_{info['head']}.pt back and choose it in Label Assistant.", parent=self.win)
 
     def _update_taps(self):
         taps, known = head_data.taps_for(self.weights_var.get())
@@ -302,8 +374,8 @@ class HeadTrainDialog(_Dialog):
             self.weights_var.set(path)
 
     # ---------------------------------------------------------- start
-    def save(self):
-        """The footer's main button: validate the settings and start."""
+    def _settings(self):
+        """The setup form as a dict, or None after telling the user what is wrong."""
         try:
             weights = self.weights_var.get().strip()
             if not weights:
@@ -328,9 +400,18 @@ class HeadTrainDialog(_Dialog):
         except (ValueError, tk.TclError) as exc:
             messagebox.showwarning("Train head", str(exc) if isinstance(exc, ValueError) else "Check the numbers.",
                                    parent=self.win)
+            return None
+        return dict(weights=weights, taps=taps, imgsz=imgsz, epochs=epochs, batch=batch, lr=lr, share=share)
+
+    def save(self):
+        """The footer's main button: validate the settings and start."""
+        st = self._settings()
+        if st is None:
             return
-        if len(self.pairs) < head_data.MIN_LABELLED:
-            messagebox.showwarning("Train head", f"Only {len(self.pairs)} images have labels. At least "
+        weights, taps, imgsz, epochs, batch, lr, share = (st[k] for k in (
+            "weights", "taps", "imgsz", "epochs", "batch", "lr", "share"))
+        if self._boxed() < head_data.MIN_LABELLED:
+            messagebox.showwarning("Train head", f"Only {self._boxed()} images have boxes. At least "
                                                  f"{head_data.MIN_LABELLED} are needed.", parent=self.win)
             return
         if os.path.exists(os.path.join(self.model_folder, HEAD_FILE)) and not messagebox.askyesno(
@@ -342,7 +423,9 @@ class HeadTrainDialog(_Dialog):
         job = build_job(images_folders=self.images_folders, labels_folder=self.labels_folder, classes=self.classes,
                         weights=weights, taps=taps, imgsz=imgsz, epochs=epochs, batch=batch, lr=lr,
                         class_weights=self.cw_var.get(), hflip=self.flip_var.get(), val_fraction=share / 100,
-                        out_dir=self.run_dir)
+                        out_dir=self.run_dir, head_type=self.kind_var.get(), head_name=workspaceName,
+                        anchors=self.cfg["custom_head"]["detector_classes"])
+        self.metric = "AP50" if job["head_type"] == "detect" else "macro-F1"
         os.makedirs(self.run_dir, exist_ok=True)
         for old in ("head_best.pt", "head_last.pt"):               # an older run must not pass for this one
             try:
@@ -447,13 +530,18 @@ class HeadTrainDialog(_Dialog):
                 self.best_epoch = ev["epoch"]
             self.bar.config(value=ev["epoch"])
             left = (ev["epochs"] - ev["epoch"]) * (sum(self.epoch_seconds) / len(self.epoch_seconds))
+            if ev.get("kind") == "detect":
+                val = f"AP50 {ev['ap50']:.3f}      precision {ev['precision']:.1%}"
+                log = f"AP50 {ev['ap50']:.3f}  precision {ev['precision']:.3f}"
+            else:
+                val = f"accuracy {ev['acc']:.1%}      macro-F1 {ev['f1']:.3f}"
+                log = f"acc {ev['acc']:.3f}  F1 {ev['f1']:.3f}"
             self.stats_label.config(
                 text=f"Epoch {ev['epoch']} / {ev['epochs']}      training loss {ev['loss']:.3f}\n"
-                     f"Validation: accuracy {ev['acc']:.1%}      macro-F1 {ev['f1']:.3f}      best epoch so far "
-                     f"{self.best_epoch}\n"
+                     f"Validation: {val}      best epoch so far {self.best_epoch}\n"
                      f"{_fmt_time(time.time() - self.started_at)} elapsed, about {_fmt_time(left)} left")
-            self._log(f"epoch {ev['epoch']:3d}/{ev['epochs']}  loss {ev['loss']:.4f}  acc {ev['acc']:.3f}  "
-                      f"F1 {ev['f1']:.3f}  recall {[round(r, 2) for r in ev['recall']]}  ({ev['seconds']:.0f}s)")
+            self._log(f"epoch {ev['epoch']:3d}/{ev['epochs']}  loss {ev['loss']:.4f}  {log}  "
+                      f"recall {[round(r, 2) for r in ev['recall']]}  ({ev['seconds']:.0f}s)")
         elif kind == "done":
             self.result = ev
         elif kind == "error":
@@ -481,7 +569,7 @@ class HeadTrainDialog(_Dialog):
             self.title_label.config(text="Training finished", fg=C_GREEN)
             self.bar.config(value=self.total_epochs)
             self.status_label.config(
-                text=f"Best head: epoch {self.result['best_epoch']}, macro-F1 {self.result['best_f1']:.3f}.\n"
+                text=f"Best head: epoch {self.result['best_epoch']}, {self.metric} {self.result['best_f1']:.3f}.\n"
                      f"Saved as {os.path.relpath(installed, BASE_DIR)} and selected in Label Assistant - G and "
                      f"Auto-annotate all use it now.", fg=C_TXT2)
         elif installed:

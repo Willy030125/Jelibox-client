@@ -20,6 +20,12 @@ class AssistantError(Exception):
     """A problem the user can act on; the message is shown as is."""
 
 
+# how every Ultralytics detector is run when it draws boxes: a big input so far-away objects are found, and a low
+# NMS IoU so one object gets one box
+AUTO_IMGSZ = 1280
+AUTO_IOU = 0.3
+
+
 # ------------------------------------------------------------------ LocateAnything
 def locate_targets(settings):
     return [t for t in settings["target_classes"] if t["prompt"].strip() and t["map_to"]]
@@ -121,9 +127,63 @@ def head_predictor(settings, confidence, workspace_classes, base_dir, device="au
     return predict
 
 
+# ------------------------------------------------------------------ stock detector only (no trained head yet)
+_pre_cache = {}   # (weights path, device) -> YOLO; at most one is kept in memory
+
+
+def detector_file(weights, base_dir):
+    """Where a stock detector (yolov8m.pt, ...) lives: a path that exists as given, otherwise Jelibox's detectors folder."""
+    if os.path.isabs(weights) or os.path.exists(weights):
+        return weights
+    return os.path.join(base_dir, "models", "_detectors", os.path.basename(weights))
+
+
+def detector_predictor(weights, confidence, class_ids, label, base_dir, iou=AUTO_IOU, imgsz=AUTO_IMGSZ):
+    """Boxes of a stock COCO detector, every one given the workspace class `label`. For drawing the boxes quickly
+    (e.g. persons) before any head is trained; the classes are then set by hand or by the trained head later.
+    A stock name that is not on disk is downloaded by ultralytics into models/_detectors."""
+    if not label:
+        raise AssistantError("Choose the class the detected boxes should get.")
+    try:
+        from . import custom_head as ch
+        import torch
+    except Exception as exc:
+        raise AssistantError(f"The detector needs torch and ultralytics ({exc}).") from exc
+    problem = ch.ultralytics_problem()
+    if problem:
+        raise AssistantError(problem)
+    path = detector_file(weights, base_dir)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    key = (path, torch.cuda.is_available())
+    model = _pre_cache.get(key)
+    if model is None:
+        _pre_cache.clear()
+        try:
+            from ultralytics import YOLO
+            model = YOLO(path)
+        except Exception as exc:
+            raise AssistantError(f"The detector {os.path.basename(weights)} could not be loaded:\n{exc}") from exc
+        _pre_cache[key] = model
+    classes = [int(i) for i in class_ids] or None
+
+    def predict(bgr):
+        with torch.no_grad():
+            res = model.predict(bgr, conf=confidence, iou=iou, imgsz=imgsz, classes=classes, verbose=False)
+        preds = []
+        for r in res:
+            for box in (r.boxes if getattr(r, "boxes", None) is not None else []):
+                x1, y1, x2, y2 = (int(round(v)) for v in box.xyxy[0].tolist())
+                if x2 - x1 >= 2 and y2 - y1 >= 2:
+                    preds.append({"rect": (x1, y1, x2, y2), "conf": float(box.conf[0].item()), "cls": label})
+        return preds, False
+
+    return predict
+
+
 def release_all():
     """Forget the cached models so their memory can be freed."""
     _head_cache.clear()
+    _pre_cache.clear()
     try:
         from . import locate_anything as la
         if la.engine.loaded:

@@ -86,7 +86,19 @@ HEAD_DEFAULTS = {
     "iou": 0.6,                     # NMS IoU of the detector
     "min_head_conf": 0.0,           # drop boxes whose head probability is below this
     "class_map": {},                # head class name -> workspace class
+    # "Annotate all" without a trained head: a stock COCO detector draws the boxes of `detector_classes` in one class
+    "annotate_with": "head",        # "head" = my trained head | "detector" = stock detector only
+    "pre_detector": "yolov8m.pt",   # one of PRE_DETECTORS
+    "pre_label": "",                # workspace class the drawn boxes get ("" = the first class)
 }
+
+PRE_DETECTORS = [
+    "yolov5mu.pt", "yolov5lu.pt", "yolov5xu.pt", "yolov5m6u.pt", "yolov5l6u.pt", "yolov5x6u.pt",
+    "yolov8m.pt", "yolov8l.pt", "yolov8x.pt",
+    "yolov9m.pt", "yolov9c.pt", "yolov9e.pt",
+    "yolo11m.pt", "yolo11l.pt", "yolo11x.pt",
+    "yolo26m.pt", "yolo26l.pt", "yolo26x.pt",
+]
 
 DEFAULT_ASSISTANT = {
     "provider": PROVIDER_YOLO_WORLD,
@@ -176,6 +188,12 @@ def _normalize_head(raw):
     out["iou"] = _num(raw.get("iou"), out["iou"], 0.05, 0.95)
     out["min_head_conf"] = _num(raw.get("min_head_conf"), out["min_head_conf"], 0.0, 1.0)
     out["class_map"] = _clean_class_map(raw.get("class_map"))
+    if raw.get("annotate_with") in ("head", "detector"):
+        out["annotate_with"] = raw["annotate_with"]
+    if raw.get("pre_detector") in PRE_DETECTORS:
+        out["pre_detector"] = raw["pre_detector"]
+    if isinstance(raw.get("pre_label"), str):
+        out["pre_label"] = raw["pre_label"]
     return out
 
 
@@ -268,6 +286,8 @@ def set_classes(workspace_name, classes):
         holder["target_classes"] = [t for t in holder["target_classes"] if t["map_to"] in data["classes"]]
     for holder in (assistant["custom_model"], assistant["custom_head"]):
         holder["class_map"] = {k: v for k, v in holder["class_map"].items() if v in data["classes"]}
+    if assistant["custom_head"]["pre_label"] not in data["classes"]:
+        assistant["custom_head"]["pre_label"] = ""
     save(workspace_name, data)
     return removed
 
