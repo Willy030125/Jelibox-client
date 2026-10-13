@@ -104,6 +104,14 @@ class DataTests(unittest.TestCase):
         self.assertAlmostEqual(h, 0.6)
         self.assertEqual(head_data.read_label_rows(os.path.join(self.tmp.name, "missing.txt")), [])
 
+    def test_empty_label_files_count_only_when_asked(self):
+        images, labels = write_dataset(self.tmp.name, 6)
+        open(os.path.join(labels, "img_02.txt"), "w").close()
+        self.assertEqual(len(head_data.labelled_pairs([images], labels)), 5)
+        pairs = head_data.labelled_pairs([images], labels, allow_empty=True)
+        self.assertEqual(len(pairs), 6)
+        self.assertEqual(head_data.class_counts(pairs, 2), [5, 5])
+
     def test_class_counts(self):
         images, labels = write_dataset(self.tmp.name, 4)
         pairs = head_data.labelled_pairs([images], labels)
@@ -141,13 +149,17 @@ if HAVE:
     class FakeModel(nn.Module):
         strides_ok = True
 
-        def __init__(self, weights, num_classes, taps=(15, 18, 21)):
+        def __init__(self, weights, num_classes, taps=(15, 18, 21), kind="classify"):
             super().__init__()
+            self.kind = kind
             self.backbone = FakeBackbone(FakeModel.strides_ok)
-            self.head = ch.BehaviorHead([3, 3, 3], num_classes)
+            self.head = ch.DetectHead([3, 3, 3], num_classes, c=32) if kind == "detect" \
+                else ch.BehaviorHead([3, 3, 3], num_classes)
 
-        def forward(self, imgs, bidx, boxes):
+        def forward(self, imgs, bidx=None, boxes=None):
             _, feats = self.backbone(imgs)
+            if self.kind == "detect":
+                return self.head(feats)
             return self.head(feats, bidx, boxes, imgs.shape[-2:])
 
 
@@ -188,7 +200,9 @@ class TrainerTests(unittest.TestCase):
         self.assertTrue(summary["has_head"])
         ck = ch.read_checkpoint(os.path.join(out, "head_best.pt"))             # weights_only load, as at annotation time
         self.assertEqual(ck["names"], ["a", "b", "unused"])
-        self.assertEqual(ck["cfg"], dict(weights="yolov8m.pt", taps=[15, 18, 21], imgsz=[64, 96], nc=3))
+        self.assertEqual(ck["cfg"], dict(weights="yolov8m.pt", taps=[15, 18, 21], imgsz=[64, 96], nc=3,
+                                         strides=[8, 16, 32]))
+        self.assertEqual(ck["kind"], "classify")
         self.assertTrue(os.path.isfile(os.path.join(out, "head_last.pt")))
 
     def test_losses_are_finite_even_with_a_class_that_has_no_examples(self):
@@ -275,6 +289,65 @@ class TrainerTests(unittest.TestCase):
         self.assertAlmostEqual((x1 + x2) / 2, 48, delta=1)
         self.assertAlmostEqual((y1 + y2) / 2, 32, delta=1)
         self.assertAlmostEqual(x2 - x1, 48, delta=1)
+
+    def test_a_detect_head_trains_on_boxes_and_on_images_with_nothing_in_them(self):
+        def rows(i):
+            return "" if i % 3 == 0 else "0 0.5 0.5 0.3 0.4\n"                   # every third image is a negative
+        images, labels = write_dataset(os.path.join(self.tmp.name, "dd"), 16, rows)
+        job = self.job(head_type="detect", classes=["phone", "call"], class_weights=False, epochs=2, anchors=[0],
+                       head_name="phone")
+        job.update(images_folders=[images], labels_folder=labels)
+        summary, events = self.run_job(job)
+        start = events[1]
+        self.assertEqual((start["kind"], start["train_images"], start["val_images"]), ("detect", 12, 4))
+        epochs = [e for e in events if e["event"] == "epoch"]
+        self.assertEqual(len(epochs), 2)
+        for e in epochs:
+            self.assertTrue(np.isfinite(e["loss"]), e)
+            self.assertIn("ap50", e)
+        self.assertEqual((summary["kind"], summary["metric"]), ("detect", "AP50"))
+        ck = ch.read_checkpoint(os.path.join(summary["out_dir"], "head_best.pt"))
+        self.assertEqual((ck["kind"], ck["names"]), ("detect", ["phone", "call"]))
+        raw = torch.load(os.path.join(summary["out_dir"], "head_best.pt"), map_location="cpu", weights_only=True)
+        self.assertEqual((raw["name"], raw["spec"]["attach_to"], raw["spec"]["anchors"]), ("phone", [0], []))
+
+    def test_a_detect_head_needs_images_with_boxes_not_just_empty_ones(self):
+        images, labels = write_dataset(os.path.join(self.tmp.name, "dn"), 12, rows=lambda i: "")
+        job = self.job(head_type="detect", classes=["phone"])
+        job.update(images_folders=[images], labels_folder=labels)
+        with self.assertRaisesRegex(ValueError, "images with boxes"):
+            self.run_job(job)
+
+    def test_an_unknown_head_type_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "Unknown head type"):
+            self.run_job(self.job(head_type="segment"))
+
+    def test_detect_targets_loss_and_decode_agree(self):
+        boxes = [torch.tensor([[40.0, 24.0, 72.0, 56.0]])]
+        heat, objs = ht.build_targets(boxes, [torch.tensor([1])], 2, (8, 12), 8)
+        self.assertEqual(heat.shape, (1, 2, 8, 12))
+        self.assertEqual(float(heat.max()), 1.0)
+        self.assertEqual(int(heat[0, 1].argmax()), 5 * 12 + 7)                 # centre (56, 40) -> cell (row 5, col 7)
+        out = dict(heat=torch.logit(heat.clamp(1e-4, 1 - 1e-4)), size=torch.zeros(1, 2, 8, 12), off=torch.zeros(1, 2, 8, 12))
+        b, _, iy, ix, lw, lh, ox, oy = [float(v) for v in objs[0]]
+        out["size"][0, :, int(iy), int(ix)] = torch.tensor([lw, lh])
+        out["off"][0, :, int(iy), int(ix)] = torch.logit(torch.tensor([ox, oy]).clamp(1e-4, 1 - 1e-4))
+        (pb, ps, pc), = ch.decode(out, 8, 0.5)
+        self.assertEqual(pc.tolist(), [1])
+        for got, want in zip(pb[0].tolist(), boxes[0][0].tolist()):
+            self.assertAlmostEqual(got, want, delta=0.5)
+        self.assertLess(float(ht.detect_loss(out, heat, objs)), 0.5)
+
+    def test_the_meter_scores_hits_and_misses(self):
+        m = ht.DetMeter(1)
+        gt = np.array([[0, 0, 10, 10], [50, 50, 70, 70]], np.float32)
+        m.update(gt, [0.9, 0.8], [0, 0], gt, [0, 0])
+        self.assertAlmostEqual(m.summary(0.5)["ap50"], 1.0)
+        m = ht.DetMeter(1)
+        m.update(np.array([[0, 0, 10, 10], [200, 200, 220, 220]], np.float32), [0.9, 0.95], [0, 0], gt, [0, 0])
+        s = m.summary(0.5)
+        self.assertLess(s["ap50"], 0.6)
+        self.assertAlmostEqual(s["precision"], 0.5)
 
     def test_a_segmentation_label_trains_like_a_box(self):
         images, labels = write_dataset(os.path.join(self.tmp.name, "d3"), 1, polygon_for=(1,))

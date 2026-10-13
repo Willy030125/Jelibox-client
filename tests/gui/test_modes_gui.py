@@ -258,10 +258,16 @@ class CustomHeadDialogTests(ModeGuiBase):
         self.assertEqual(h["class_map"], {"cat": "cat", "walking": "dog"})
         self.assertEqual(os.path.normcase(h["head_path"]), os.path.normcase(head))
 
-    def test_missing_checkpoint_and_bad_classes_are_refused(self):
+    def test_saving_without_a_head_is_allowed_but_a_wrong_path_or_class_is_refused(self):
         dlg = self.open()
+        dlg.pre_var.set("yolo26x.pt")
+        dlg.save()                                                       # no head yet: the detector alone can still annotate
+        self.assertEqual(self.rec.of("showwarning"), [])
+        self.assertEqual(wc.get_assistant(WORKSPACE)["custom_head"]["pre_detector"], "yolo26x.pt")
+        dlg = self.open()
+        dlg.path_var.set(os.path.join(ctx.model_dir, "nope.pt"))
         dlg.save()
-        self.assertIn("head_best.pt", self.rec.of("showwarning")[-1][2])
+        self.assertIn("nope.pt", self.rec.of("showwarning")[-1][2])
         head = self.make_head()
         dlg.path_var.set(head)
         dlg._load_head(head)

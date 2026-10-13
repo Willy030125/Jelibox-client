@@ -59,6 +59,22 @@ class HeadTests(unittest.TestCase):
         self.assertEqual(tuple(out.shape), (3, 4))
         torch.testing.assert_close(reordered, out[[2, 0, 1]], rtol=1e-4, atol=1e-4)   # box order must not matter
 
+    def test_detect_head_output_shapes_and_decode_filters_by_score(self):
+        torch.manual_seed(0)
+        chs = [64, 128, 256]
+        feats = [torch.randn(2, c, 640 // s, 640 // s) for c, s in zip(chs, (8, 16, 32))]
+        head = ch.DetectHead(chs, 3).eval()
+        with torch.no_grad():
+            out = head(feats)
+        self.assertEqual(tuple(out["heat"].shape), (2, 3, 80, 80))
+        self.assertEqual(tuple(out["size"].shape), (2, 2, 80, 80))
+        self.assertEqual(len(ch.decode(out, 8, 0.5)[0][1]), 0, "an untrained head starts below p = 0.5")
+        out["heat"][1, 2, 10, 20] = 5.0
+        (b0, s0, c0), (b1, s1, c1) = ch.decode(out, 8, 0.5)
+        self.assertEqual((len(s0), c1.tolist()), (0, [2]))
+        cx, cy = (b1[0, 0] + b1[0, 2]) / 2, (b1[0, 1] + b1[0, 3]) / 2
+        self.assertTrue(20 * 8 <= cx <= 21 * 8 and 10 * 8 <= cy <= 11 * 8)
+
     def test_end_to_end_detector_output_is_filtered_by_confidence_and_class(self):
         fake = ch.HeadDetector.__new__(ch.HeadDetector)         # only _detections is used
         out = torch.tensor([[[10, 10, 50, 50, 0.9, 0], [60, 60, 90, 90, 0.2, 0], [5, 5, 30, 30, 0.8, 39]]], dtype=torch.float32)
@@ -88,6 +104,18 @@ class CheckpointTests(unittest.TestCase):
         ck = ch.read_checkpoint(self.save(self.good()))
         self.assertEqual(ck["names"], ["a", "b"])
         self.assertEqual(ck["cfg"]["taps"], [16, 19, 22])
+
+    def test_new_checkpoints_carry_the_head_kind_and_old_ones_are_classify_heads(self):
+        ck = ch.read_checkpoint(self.save(self.good()))
+        self.assertEqual((ck["kind"], ck["cfg"]["strides"], ck["cfg"]["nc"]), ("classify", [8, 16, 32], 2))
+        new = self.good()
+        new["spec"] = {"type": "detect", "names": ["a", "b"], "anchors": [], "attach_to": [], "head_args": {}}
+        new["cfg"] = {"weights": "yolo11n.pt", "taps": [16, 19, 22], "imgsz": [384, 640], "strides": [8, 16, 32]}
+        ck = ch.read_checkpoint(self.save(new, "d.pt"))
+        self.assertEqual((ck["kind"], ck["cfg"]["nc"]), ("detect", 2))
+        new["spec"]["type"] = "segment"
+        with self.assertRaisesRegex(ValueError, "unknown head type"):
+            ch.read_checkpoint(self.save(new, "s.pt"))
 
     def test_missing_keys_and_missing_files_are_explained(self):
         with self.assertRaises(ValueError) as e:

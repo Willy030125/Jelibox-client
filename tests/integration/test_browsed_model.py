@@ -43,7 +43,7 @@ class FakeYolo:
     def __init__(self, names, boxes):
         self.names, self._boxes, self.calls = names, boxes, []
 
-    def predict(self, img, conf=None, iou=None, verbose=None):
+    def predict(self, img, conf=None, iou=None, imgsz=None, verbose=None):
         self.calls.append(conf)
         return [Result(self._boxes)]
 

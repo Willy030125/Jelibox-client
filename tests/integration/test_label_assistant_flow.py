@@ -36,8 +36,8 @@ class FakeModel:
     def __init__(self, boxes):
         self._boxes, self.calls = boxes, []
 
-    def predict(self, img, conf=None, iou=None, verbose=None):
-        self.calls.append({"conf": conf, "iou": iou})
+    def predict(self, img, conf=None, iou=None, imgsz=None, verbose=None):
+        self.calls.append({"conf": conf, "iou": iou, "imgsz": imgsz})
         return [Result(self._boxes)]
 
 
@@ -102,6 +102,7 @@ class LabelAssistantFlowTests(unittest.TestCase):
         inf.inference_current(IMAGES, 0)
         self.assertEqual(self.loaded_prompts[0][0], "yolov8m-worldv2")
         self.assertEqual(fake.calls[0]["conf"], 0.55)
+        self.assertEqual((fake.calls[0]["imgsz"], fake.calls[0]["iou"]), (1280, 0.3))
 
     def test_overlapping_predictions_do_not_duplicate_existing_boxes(self):
         set_assistant(targets=[{"prompt": "cat", "map_to": "cat"}])

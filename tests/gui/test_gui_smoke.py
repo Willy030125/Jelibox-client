@@ -3,6 +3,7 @@ Skipped automatically when there is no display (e.g. a headless CI box)."""
 import os
 import re
 import time
+import types
 import tkinter as tk
 from tkinter import ttk
 import unittest
@@ -131,7 +132,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_keyboard_shortcuts_are_bound(self):
         bound = set(self.root.bind())
-        for seq in ("b", "m", "g", "t", "e", "r", "s", "1", "9",
+        for seq in ("b", "v", "m", "g", "t", "e", "r", "s", "1", "9",
                     "<Key-Delete>", "<Key-Escape>", "<Key-Return>", "<Key-Left>", "<Key-Right>"):
             self.assertIn(seq, bound)
 
@@ -165,11 +166,11 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(config.state.annotation_mode, "bbox")
         self.assertIn("BBOX", self.gui.statusbar_mode.cget("text"))
 
-    def test_force_indicator_lives_in_the_status_bar(self):
-        self.gui.toggle_force_new_bbox()
-        self.assertEqual(self.gui.force_label.cget("text"), "Force: ON")
-        self.gui.toggle_force_new_bbox()
-        self.assertEqual(self.gui.force_label.cget("text"), "Force: OFF")
+    def test_active_tool_lives_in_the_status_bar(self):
+        self.gui.set_edit_tool("select")
+        self.assertIn("SELECT", self.gui.tool_label.cget("text"))
+        self.gui.set_edit_tool("draw")
+        self.assertIn("DRAW", self.gui.tool_label.cget("text"))
         self.assertFalse(hasattr(self.gui, "mode_label"), "the redundant top-right mode badge is gone")
         self.assertFalse(hasattr(self.gui, "text_label"), "the redundant 'Text: ON' badge is gone")
 
@@ -202,6 +203,142 @@ class MainWindowTests(unittest.TestCase):
         config.state.current_index = index
         self.gui.load_current_image()
         self.gui.update_display()
+
+    # ------------------------------------------------------------ draw / select tools
+    def _ev(self, x, y, state=0):
+        """A mouse event at image pixel (x, y) (the image is shown at 1:1)."""
+        g = self.gui
+        return types.SimpleNamespace(x=x + g.canvas_offset_x, y=y + g.canvas_offset_y, state=state, num=1)
+
+    def _drag(self, start, end):
+        g = self.gui
+        g.on_mouse_down(self._ev(*start))
+        g.on_mouse_drag(self._ev(*end))
+        g.on_mouse_up(self._ev(*end))
+
+    def _two_classes(self):
+        classes = config.class_manager.get_classes()
+        self.assertGreaterEqual(len(classes), 2)
+        return classes[0], classes[1]
+
+    def test_draw_tool_always_draws_even_over_an_existing_box(self):
+        self._fresh_image()
+        a, _ = self._two_classes()
+        s = config.state
+        s.current_class = a
+        s.bboxes = [[20, 20, 200, 160, a]]
+        self.gui.set_edit_tool("draw")
+        self._drag((60, 60), (120, 110))
+        self.assertEqual(len(s.bboxes), 2)
+        self.assertEqual(s.bboxes[0][:4], [20, 20, 200, 160])            # the old box did not move
+        self.assertEqual(s.bboxes[1][:4], [60, 60, 120, 110])
+        self.assertIsNone(s.selected_bbox)
+
+    def test_select_tool_picks_moves_and_clamps_to_the_image(self):
+        self._fresh_image()
+        a, _ = self._two_classes()
+        s = config.state
+        s.bboxes = [[20, 20, 100, 80, a]]
+        self.gui.set_edit_tool("select")
+        self._drag((60, 50), (80, 70))                                   # inside the box: move by (20, 20)
+        self.assertEqual([round(v) for v in s.bboxes[0][:4]], [40, 40, 120, 100])
+        self.assertEqual(len(s.bboxes), 1, "the select tool never draws")
+        self._drag((80, 70), (600, 600))                                 # dragged far outside: stays inside the image
+        x1, y1, x2, y2 = s.bboxes[0][:4]
+        self.assertEqual((round(x2 - x1), round(y2 - y1)), (80, 60))
+        self.assertLessEqual(x2, s.orig_width)
+        self.assertLessEqual(y2, s.orig_height)
+        self.gui.undo()
+        self.assertEqual([round(v) for v in s.bboxes[0][:4]], [40, 40, 120, 100])
+
+    def test_select_tool_resizes_from_a_corner_dot_and_deselects_on_empty_ground(self):
+        self._fresh_image()
+        a, _ = self._two_classes()
+        s = config.state
+        s.bboxes = [[40, 40, 140, 120, a]]
+        self.gui.set_edit_tool("select")
+        self.gui.on_mouse_down(self._ev(80, 80))                         # select it
+        self.gui.on_mouse_up(self._ev(80, 80))
+        self.assertEqual(s.selected_bbox, 0)
+        self._drag((140, 120), (180, 150))                               # the bottom-right dot
+        self.assertEqual([round(v) for v in s.bboxes[0][:4]], [40, 40, 180, 150])
+        self._drag((40, 40), (50, 60))                                   # the top-left dot, opposite corner stays
+        self.assertEqual([round(v) for v in s.bboxes[0][:4]], [50, 60, 180, 150])
+        self._drag((230, 200), (231, 201))                               # empty ground: deselect, nothing drawn
+        self.assertIsNone(s.selected_bbox)
+        self.assertEqual(len(s.bboxes), 1)
+
+    def test_class_menu_relabels_the_selected_box_and_undo_restores_it(self):
+        self._fresh_image()
+        a, b = self._two_classes()
+        s = config.state
+        s.bboxes = [[20, 20, 100, 80, a]]
+        g = self.gui
+        self.assertEqual(str(g.class_combo.cget("state")), "disabled")
+        g.set_edit_tool("select")
+        g.on_mouse_down(self._ev(50, 50))
+        g.on_mouse_up(self._ev(50, 50))
+        self.assertEqual(str(g.class_combo.cget("state")), "readonly")
+        self.assertEqual(g.class_var.get(), a)
+        self.assertIn(b, g.class_combo.cget("values"))
+        g.class_var.set(b)
+        g.on_box_class_chosen()
+        self.assertEqual(s.bboxes[0][4], b)
+        self.assertEqual(s.bboxes[0][:4], [20, 20, 100, 80], "only the class changed")
+        g.undo()
+        self.assertEqual(s.bboxes[0][4], a)
+
+    def test_click_picks_the_box_on_top_and_layers_reorder_the_saved_lines(self):
+        from utils.file_handler import _yolo_lines_from_annotations
+        self._fresh_image()
+        a, b = self._two_classes()
+        s = config.state
+        s.bboxes = [[20, 20, 140, 120, a], [60, 50, 180, 150, b], [10, 10, 30, 30, a]]
+        g = self.gui
+        g.update_info()
+        self.assertEqual(g._layer_rows, [2, 1, 0], "top of the list = last box = drawn in front")
+        self.assertEqual(g.layer_listbox.size(), 3)
+        g.set_edit_tool("select")
+        g.on_mouse_down(self._ev(100, 90))                               # inside both: the front one wins
+        g.on_mouse_up(self._ev(100, 90))
+        self.assertEqual(s.selected_bbox, 1)
+        # pick the box behind through the list and bring it to the front
+        g.layer_listbox.selection_clear(0, tk.END)
+        g.layer_listbox.selection_set(g._layer_rows.index(0))
+        g.on_layer_select()
+        self.assertEqual(s.selected_bbox, 0)
+        g.move_layer("front")
+        self.assertEqual([bx[4] for bx in s.bboxes], [b, a, a])
+        self.assertEqual(s.selected_bbox, 2)
+        lines = _yolo_lines_from_annotations(s.bboxes, [], [a, b], 320, 240)
+        self.assertEqual([ln.split()[0] for ln in lines], ["1", "0", "0"], "the saved file follows the layer order")
+        g.move_layer("back")
+        self.assertEqual(s.selected_bbox, 0)
+        g.move_layer("forward")
+        self.assertEqual(s.selected_bbox, 1)
+        g.move_layer("backward")
+        self.assertEqual(s.selected_bbox, 0)
+        g.undo()
+        g.undo()
+        g.undo()
+        g.undo()
+        self.assertEqual([bx[4] for bx in s.bboxes], [a, b, a])
+
+    def test_choosing_a_layer_from_the_draw_tool_switches_to_select(self):
+        self._fresh_image()
+        a, _ = self._two_classes()
+        config.state.bboxes = [[20, 20, 100, 80, a]]
+        g = self.gui
+        g.update_info()
+        g.set_edit_tool("draw")
+        g.layer_listbox.selection_set(0)
+        g.on_layer_select()
+        self.assertEqual(g.edit_tool, "select")
+        self.assertEqual(config.state.selected_bbox, 0)
+        self.assertEqual(str(g.delete_box_btn.cget("state")), "normal")
+        g.set_edit_tool("draw")
+        self.assertIsNone(config.state.selected_bbox)
+        self.assertEqual(str(g.delete_box_btn.cget("state")), "disabled")
 
     def test_undo_redo_buttons_and_shortcuts_exist(self):
         find_button(self.root, "Undo")
