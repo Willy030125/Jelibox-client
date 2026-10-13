@@ -23,6 +23,7 @@
 #   JELIBOX_FORCE       1 = reinstall even when this version is already installed
 #   JELIBOX_GPU         nvidia | cpu = which PyTorch to install without being asked (default: you are asked)
 #   JELIBOX_ARCHIVE     path to a local .tar.gz instead of downloading (offline installs, tests)
+#   JELIBOX_URL         URL of a .tar.gz to install instead of the GitHub release (tools/serve_local.py serves one from your own copy)
 
 # Everything lives in one function so bash has read the whole script before running any of it.
 # (When piped into bash, a command that reads stdin could otherwise swallow the rest of the script.)
@@ -33,6 +34,7 @@ main() {
     local dest="${JELIBOX_HOME:-}"
     local version="${JELIBOX_VERSION:-}"
     local archive="${JELIBOX_ARCHIVE:-}"
+    local custom_url="${JELIBOX_URL:-}"
     local installed="" existing=0 url=""
 
     say()  { printf '\033[1;36m[Jelibox]\033[0m %s\n' "$*"; }
@@ -119,6 +121,10 @@ main() {
     if [ -n "$archive" ]; then
         [ -f "$archive" ] || fail "JELIBOX_ARCHIVE not found: $archive"
         say "Using local archive $archive"
+    elif [ -n "$custom_url" ]; then
+        url="$custom_url"
+        archive="$tmp/jelibox.tar.gz"
+        say "Downloading Jelibox from $url ..."
     else
         if [ -z "$version" ]; then
             if download "https://api.github.com/repos/$repo/releases/latest" "$tmp/latest.json" 2>/dev/null; then
@@ -142,6 +148,7 @@ main() {
     # Fresh install, update, or nothing to do?
     local target="${version:-main}"
     [ -z "${JELIBOX_ARCHIVE:-}" ] || target="${version:-local archive}"
+    [ -z "$custom_url" ] || target="local build"
     if [ "$existing" = "1" ]; then
         if [ -n "$version" ] && [ "$version" != "main" ] && [ "$installed" = "$version" ] && [ -f "$dest/.jelibox-ready" ] \
                 && [ "${JELIBOX_FORCE:-}" != "1" ]; then
@@ -207,6 +214,16 @@ main() {
     local top
     top="$(find "$tmp/src" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
     [ -n "$top" ] || fail "The downloaded archive is empty."
+    if [ -n "$custom_url" ] || [ -n "${JELIBOX_ARCHIVE:-}" ]; then
+        # a local build names its top folder Jelibox-client-<version>; that is the version label
+        case "$(basename "$top")" in Jelibox-client-*) target="$(basename "$top")"; target="${target#Jelibox-client-}" ;; esac
+        if [ "$existing" = "1" ] && [ "$installed" = "$target" ] && [ -f "$dest/.jelibox-ready" ] \
+                && [ "${JELIBOX_FORCE:-}" != "1" ]; then
+            say "Jelibox $target is already installed and up to date ($dest)."
+            say "Nothing to do. (JELIBOX_FORCE=1 reinstalls it anyway.)"
+            return 0
+        fi
+    fi
 
     mkdir -p "$dest"
     # Copy over the existing install. Nothing is deleted, so datasets/models/configs/venv survive an update.

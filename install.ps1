@@ -22,6 +22,7 @@
 #   JELIBOX_FORCE       1 = reinstall even when this version is already installed
 #   JELIBOX_GPU         nvidia | cpu = which PyTorch to install without being asked (default: you are asked)
 #   JELIBOX_ARCHIVE     path to a local .zip instead of downloading (offline installs, tests)
+#   JELIBOX_URL         URL of a .zip to install instead of the GitHub release (tools/serve_local.py serves one from your own copy)
 
 function Install-Jelibox {
     $ErrorActionPreference = 'Stop'
@@ -33,6 +34,7 @@ function Install-Jelibox {
     $repo    = 'Jelibox/Jelibox-client'
     $version = $env:JELIBOX_VERSION
     $archive = $env:JELIBOX_ARCHIVE
+    $customUrl = $env:JELIBOX_URL
 
     function Say([string]$text)  { Write-Host "[Jelibox] $text" -ForegroundColor Cyan }
     function Fail([string]$text) { Write-Host "[Jelibox] $text" -ForegroundColor Red; throw $text }
@@ -111,6 +113,10 @@ function Install-Jelibox {
             if (-not (Test-Path $archive)) { Fail "JELIBOX_ARCHIVE not found: $archive" }
             $zip = $archive
             Say "Using local archive $archive"
+        } elseif ($customUrl) {
+            $url = $customUrl
+            $zip = Join-Path $tmp 'jelibox.zip'
+            Say "Downloading Jelibox from $url ..."
         } else {
             if (-not $version) {
                 try {
@@ -134,7 +140,7 @@ function Install-Jelibox {
         }
 
         # Fresh install, update, or nothing to do?
-        $target = if ($version) { $version } elseif ($archive) { 'local archive' } else { 'main' }
+        $target = if ($version) { $version } elseif ($archive) { 'local archive' } elseif ($customUrl) { 'local build' } else { 'main' }
         if ($existing) {
             if ($version -and ($version -ne 'main') -and ($installed -eq $version) -and (Test-Path -LiteralPath (Join-Path $dest '.jelibox-ready')) -and ($env:JELIBOX_FORCE -ne '1')) {
                 Say "Jelibox $version is already installed and up to date ($dest)."
@@ -192,6 +198,15 @@ function Install-Jelibox {
         Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
         $top = Get-ChildItem -LiteralPath $extract -Directory | Select-Object -First 1
         if (-not $top) { Fail 'The downloaded archive is empty.' }
+        if ($customUrl -or $archive) {
+            # a local build names its top folder Jelibox-client-<version>; that is the version label
+            if ($top.Name -match '^Jelibox-client-(.+)$') { $target = $Matches[1] }
+            if ($existing -and ($installed -eq $target) -and (Test-Path -LiteralPath (Join-Path $dest '.jelibox-ready')) -and ($env:JELIBOX_FORCE -ne '1')) {
+                Say "Jelibox $target is already installed and up to date ($dest)."
+                Say 'Nothing to do. (JELIBOX_FORCE=1 reinstalls it anyway.)'
+                return
+            }
+        }
 
         New-Item -ItemType Directory -Force -Path $dest | Out-Null
         # Copy over the existing install. Nothing is deleted, so datasets/models/configs/venv survive an update.

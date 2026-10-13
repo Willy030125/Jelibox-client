@@ -66,6 +66,34 @@ Installing through `install.ps1` replaced the user's Python 3.10 setup:
 - Label Assistant dialogs scroll: new `utils/dialog_scroll.py` (`ScrollBody`). Header and Save / Cancel stay pinned, the body scrolls and the window is never taller than the screen (125% scale on 1080p leaves ~860 px; a 14-class head pushed Save off the screen). Used by `ModeDialogs._Dialog` (LocateAnything + Custom head) and `LabelAssistantDialog`. Tests: `DialogScrollTests`.
 - Train in Custom head mode: `utils/head_data.py` (labels <-> images, position-based split, taps per detector family), `utils/head_train.py` (trainer subprocess: dataset/augmentation/jitter ported from `TOBEADDED/custom_dual_heads`, class weights ignore classes with no examples, stride check on the taps, detector fingerprint check, `@@ {json}` progress events), `utils/HeadTrainDialog.py` (setup + progress window, Stop keeps the best head so far, installs `models/<ws>/head_best.pt`, keeps the old one as `head_best.prev.pt`, selects it in Label Assistant), `AnnotationGUI._train_head`, `FrozenYOLO.strides_ok/fingerprint`. Defaults per the user: yolov8m.pt, 384x640, 50 epochs, batch 16, class weights on. Tests: `tests/unit/test_head_train.py`, `HeadTrainDialogTests` + two routing tests in `tests/gui/test_modes_gui.py`. Real run: 40 `testt` images, user's yolov8m.pt, CPU, 2 epochs through the window; the head then annotated `testt` (17 `standing` boxes on 10 images).
 
+## Custom head: detect heads (fourth round)
+
+- `utils/custom_head.py`: `DetectHead` + `decode` (centre-based head on the stride-8 features, ported from the command-line trainer), `BehaviorModel(kind=...)`, `read_checkpoint` accepts the new format (`spec`, `strides`, optional `nc`) and old ones (classify), `HeadDetector.predict` returns the head's own boxes for a detect head.
+- `utils/head_train.py`: job key `head_type` (`classify` / `detect`), detect targets / focal loss / AP50 meter, empty label files count for a detect head (`head_data.labelled_pairs(allow_empty=True)`), checkpoint `name` = workspace, `spec.anchors` / `spec.attach_to` from the Label Assistant's detector classes.
+- `utils/HeadTrainDialog.py`: Head type choice and per-kind progress text; `utils/ModeDialogs.py`: the head info line says which kind a checkpoint is.
+- Tests: `tests/unit/test_head_train.py` and `test_custom_head.py` (detect training, decode, meter, checkpoint kinds). Real check: yolov8m, one picture (`capture_image.png`, 16 copies), a classify head (standing / working) and a detect head (using_phone) trained through `utils.head_train` and read back through `assistant_providers.head_predictor` and the command-line `engine.py`.
+
+## Install from this copy (fifth round)
+
+- `tools/serve_local.py`: packs the working tree (no user data, venv or caches) into `dist/jelibox-local.zip` / `.tar.gz` and serves `dist/` over HTTP; `/install.ps1` and `/install.sh` are the repo's installers with `JELIBOX_URL` set to that server (from the request's Host header).
+- `install.ps1` / `install.sh`: new `JELIBOX_URL` (archive URL); with `JELIBOX_URL` or `JELIBOX_ARCHIVE` the version label comes from the archive's top folder and an install that is already ready with the same label is not repeated.
+- Checked: both one-liners against the local server with `JELIBOX_NO_INSTALL=1` (fresh install, update keeps `datasetsInput`). The full dependency install (uv, PyTorch) was not re-run.
+
+## Custom head: detector-only Annotate all, export for the trainer (sixth round)
+
+- `utils/assistant_providers.py`: `detector_predictor` (stock COCO detector, every box gets one workspace class; downloaded into `models/_detectors` on first use), `detector_file`.
+- `utils/workspace_config.py`: `custom_head` gains `annotate_with`, `pre_detector` (`PRE_DETECTORS` = 18 stock models: yolov5 mu/lu/xu/m6u/l6u/x6u, yolov8 m/l/x, yolov9 m/c/e, yolo11 m/l/x, yolo26 m/l/x), `pre_label`; the detector classes and confidence are the existing Label Assistant settings.
+- `utils/ModeDialogs.py`: Label Assistant (Custom head) has the detector-model choice and no longer requires a head checkpoint to save. `utils/AutoAnnotateDialog.py`: the two variants + the class the drawn boxes get.
+- `utils/head_export.py` + `HeadTrainDialog` *Export for training on another PC*: `images/{train,val}`, `labels_<head>/{train,val}` (4-number rows; polygons become boxes; a detect head keeps empty files as negatives) and `<head>.yaml` for the trainer's `train.py`.
+- Checked: the variant on `capture_image.png` (3 persons, yolov8m); exports of a classify and a detect head each trained one epoch with the command-line `train.py`. Only `tests/unit/test_head_export.py` was run (the whole suite was not, by request); everything compiles.
+
+## Draw / Select tools, Layers, Custom head description (seventh round)
+
+- `utils/AnnotationGUI.py`: tool bar above the canvas (`Draw box` / `Select`, keys `B` / `V`; `self.edit_tool`), the old click-inside-a-box-to-move behaviour of the single mode is now the Select tool and Draw always draws. Select: `_begin_select_drag` (handles of the selected box first, then the frontmost box), move and resize clamped to the image, four white corner dots (`draw_bbox_handles`), move/resize cursors, class menu (`on_box_class_chosen`), Delete box. The *Force new bbox* indicator and `toggle_force_new_bbox` are gone (Draw mode replaces them; the status bar shows the active tool).
+- Layers (left panel, under Visibility): `refresh_layers`, `move_layer`. Order of `state.bboxes` = order of the saved lines; the LAST box is the front one (drawn on top, listed first), so a new box starts in front. Polygons are not in the list.
+- `utils/assistant_modes.py`: Custom head card text for any task (title unchanged).
+- Tests: new cases in `tests/gui/test_gui_smoke.py` (draw over a box, move/clamp, corner resize, class menu + undo, frontmost pick, layer order in the saved lines). Only those were run, not the whole suite (by request).
+
 ## Verification
 - `python tests/run.py --only repo,unit`: all pass.
 - `tools/setup_python.ps1` run for real on Windows twice, in a temp folder: with uv already installed, and with uv hidden so the official installer ran (uv into a temp dir). Both produced a working Python 3.12.10 with Tkinter inside the folder; the user PATH was unchanged and `py --list` still shows only Python 3.10.
