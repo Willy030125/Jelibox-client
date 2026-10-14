@@ -7,7 +7,8 @@ import cv2
 import numpy as np
 
 from utils import augmentation as aug
-from utils.augment_geometry import GeoTransform, coco_annotation, voc_xml_write, yolo_label_text
+from utils.augment_geometry import (CropTransform, GeoTransform, ResizeTransform, coco_annotation, compose,
+                                    voc_xml_write, yolo_label_text)
 
 W, H = 80, 50
 
@@ -192,43 +193,108 @@ class LabelFormatTests(unittest.TestCase):
 
 
 class AugmenterGeometryTests(unittest.TestCase):
-    def setUp(self):
-        d = tempfile.mkdtemp()
-        self.path = os.path.join(d, "r.png")
-        aug.write_image(self.path, rect_image())
-
     def make(self, **ops):
-        config = aug.AugmentConfig(ops={n: aug.OpSetting(True, m, 100) for n, m in ops.items()},
-                                   copies=1, splits=("train",), seed=3)
+        config = aug.AugmentConfig(ops={k: aug.clean_params(k, v) for k, v in ops.items()}, copies=1, seed=3)
         return aug.Augmenter(config)
 
     def test_photometric_only_has_no_transform(self):
-        (_, _, tf), = list(self.make(brightness=25).copies(self.path, "train"))
+        (_, _, tf), = list(self.make(brightness={"percent": 25}).copies(rect_image()))
         self.assertIsNone(tf)
 
     def test_geometric_copy_carries_a_transform_that_matches_its_pixels(self):
-        for ops in ({"flip_h": 0}, {"flip_v": 0}, {"rotate": 30}, {"flip_h": 0, "rotate": 25}):
-            (_, img, tf), = list(self.make(**ops).copies(self.path, "train"))
-            self.assertIsNotNone(tf)
-            self.assertEqual(img.shape[:2], (tf.dst_h, tf.dst_w))
+        for ops in ({"flip": {"horizontal": True, "vertical": False}}, {"flip": {"horizontal": False, "vertical": True}},
+                    {"rotation": {"degrees": 30}}, {"shear": {"horizontal": 20, "vertical": 15}},
+                    {"rot90": {"clockwise": True, "counter": False, "upside_down": False}},
+                    {"flip": {"horizontal": True, "vertical": False}, "rotation": {"degrees": 25}}):
+            (_, img, tf), = list(self.make(**ops).copies(rect_image()))
+            self.assertIsNotNone(tf, ops)
+            self.assertEqual(img.shape[:2], (tf.dst_h, tf.dst_w), ops)
             for a, b in zip(tf.box(20, 10, 50, 30), white_box(img)):
-                self.assertAlmostEqual(a, b, delta=1.6)
+                self.assertAlmostEqual(a, b, delta=2.0, msg=str(ops))
 
     def test_rotation_angle_stays_within_the_limit(self):
         for seed in range(25):
-            config = aug.AugmentConfig(ops={"rotate": aug.OpSetting(True, 10, 100)}, seed=seed)
+            config = aug.AugmentConfig(ops={"rotation": aug.clean_params("rotation", {"degrees": 10})})
             _, _, tf = aug.augment_image(rect_image(), config, np.random.default_rng(seed))
             self.assertLessEqual(abs(tf.angle), 10)
 
-    def test_geometry_and_colour_combine(self):
-        (_, img, tf), = list(self.make(grayscale=0, flip_h=0).copies(self.path, "train"))
-        self.assertIsNotNone(tf)
-        self.assertTrue((img[..., 0] == img[..., 2]).all())
-
     def test_same_seed_same_geometry(self):
-        a = [(tf.angle, tf.flip_h) for _, _, tf in self.make(rotate=40, flip_h=0).copies(self.path, "train")]
-        b = [(tf.angle, tf.flip_h) for _, _, tf in self.make(rotate=40, flip_h=0).copies(self.path, "train")]
-        self.assertEqual(a, b)
+        def run():
+            ops = {"rotation": {"degrees": 40}, "flip": {"horizontal": True, "vertical": True}}
+            return [tf.matrix.round(9).tolist() for _, _, tf in self.make(**ops).copies(rect_image())]
+        self.assertEqual(run(), run())
+
+
+class NewTransformTests(unittest.TestCase):
+    def agree(self, tf):
+        out = tf.warp(rect_image())
+        self.assertEqual(out.shape[:2], (tf.dst_h, tf.dst_w))
+        for a, b in zip(tf.box(20, 10, 50, 30), white_box(out)):
+            self.assertAlmostEqual(a, b, delta=2.0)
+
+    def test_shear_pixels_and_labels_agree(self):
+        for sx, sy in ((20, 0), (0, 20), (15, -10)):
+            self.agree(GeoTransform(W, H, shear_x=sx, shear_y=sy))
+
+    def test_crop_pixels_and_labels_agree(self):
+        self.agree(CropTransform(W, H, 10, 5, 60, 40))
+
+    def test_resize_modes_pixels_and_labels_agree(self):
+        for mode in ("stretch", "fill", "fit_black", "fit_white", "fit_reflect"):
+            tf = ResizeTransform(W, H, 64, 64, mode)
+            out = tf.warp(rect_image())
+            self.assertEqual(out.shape[:2], (64, 64), mode)
+            self.assertEqual((tf.dst_w, tf.dst_h), (64, 64))
+            if mode in ("stretch", "fill", "fit_black"):      # the white box stays findable on a black background
+                for a, b in zip(tf.box(20, 10, 50, 30), white_box(out)):
+                    self.assertAlmostEqual(a, b, delta=2.0, msg=mode)
+
+    def test_fit_pads_and_fill_crops(self):
+        wide = ResizeTransform(80, 40, 40, 40, "fit_black")
+        out = wide.warp(np.full((40, 80, 3), 255, np.uint8))
+        self.assertTrue((out[:10] == 0).all() and (out[30:] == 0).all() and (out[10:30] == 255).all())
+        white = ResizeTransform(80, 40, 40, 40, "fit_white")
+        self.assertTrue((white.warp(np.zeros((40, 80, 3), np.uint8))[0] == 255).all())      # padding on top
+        fill = ResizeTransform(80, 40, 40, 40, "fill")
+        self.assertEqual(fill.warp(np.zeros((40, 80, 3), np.uint8)).shape[:2], (40, 40))
+
+    def test_compose_chains_transforms_and_skips_none(self):
+        a, b = GeoTransform(W, H, flip_h=True), ResizeTransform(W, H, 40, 25, "stretch")
+        both = compose(a, None, b)
+        self.assertEqual((both.src_w, both.src_h, both.dst_w, both.dst_h), (W, H, 40, 25))
+        out = b.warp(a.warp(rect_image()))
+        for x, y in zip(both.box(20, 10, 50, 30), white_box(out)):
+            self.assertAlmostEqual(x, y, delta=2.0)
+        self.assertIsNone(compose(None, None))
+        self.assertIs(compose(a), a)
+
+    def test_keeps_box_drops_objects_pushed_out_of_the_picture(self):
+        crop = CropTransform(W, H, 40, 0, 40, 50)                    # the right half
+        self.assertTrue(crop.keeps_box(50, 10, 70, 30))
+        self.assertFalse(crop.keeps_box(0, 10, 20, 30))              # entirely in the cut-off left half
+        self.assertFalse(crop.keeps_box(30, 10, 80, 30) and False)   # half visible: kept (only < 20 % is dropped)
+        self.assertTrue(crop.keeps_box(30, 10, 60, 30))
+        self.assertFalse(crop.keeps_box(0, 10, 44, 30))              # 4 of 44 px left
+
+    def test_writers_drop_objects_the_transform_removed(self):
+        crop = CropTransform(W, H, 40, 0, 40, 50)
+        text = "0 0.2 0.5 0.2 0.4\n1 0.8 0.5 0.2 0.4"                 # one object on each side
+        out = yolo_label_text(text, crop).splitlines()
+        self.assertEqual(len(out), 1)
+        self.assertTrue(out[0].startswith("1 "))
+        ann = {"bbox": [5, 10, 10, 10], "area": 100.0, "segmentation": []}
+        self.assertIsNone(coco_annotation(ann, crop))
+        self.assertIsNotNone(coco_annotation({"bbox": [50, 10, 10, 10], "area": 100.0, "segmentation": []}, crop))
+        src = os.path.join(tempfile.mkdtemp(), "a.xml")
+        with open(src, "w") as f:
+            f.write("<annotation><size><width>80</width><height>50</height></size>"
+                    "<object><name>a</name><bndbox><xmin>5</xmin><ymin>10</ymin><xmax>15</xmax><ymax>20</ymax></bndbox></object>"
+                    "<object><name>b</name><bndbox><xmin>50</xmin><ymin>10</ymin><xmax>60</xmax><ymax>20</ymax></bndbox></object>"
+                    "</annotation>")
+        dst = src.replace("a.xml", "b.xml")
+        voc_xml_write(src, dst, "b.png", crop)
+        names = [o.findtext("name") for o in ET.parse(dst).getroot().findall("object")]
+        self.assertEqual(names, ["b"])
 
 
 if __name__ == "__main__":

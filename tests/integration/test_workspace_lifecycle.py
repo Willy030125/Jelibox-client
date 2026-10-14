@@ -73,6 +73,41 @@ class YoloImportTests(unittest.TestCase):
         finally:
             wm.delete_workspace("imported")
 
+    def test_train_valid_test_folders_become_the_splits_of_the_images(self):
+        src = tempfile.mkdtemp()
+        with open(os.path.join(src, "data.yaml"), "w") as f:
+            f.write("names: ['apple', 'pear']\n")
+        expected = {}
+        for split in ("train", "valid", "test"):
+            os.makedirs(os.path.join(src, split, "images"))
+            os.makedirs(os.path.join(src, split, "labels"))
+            for i in range(2):
+                name = f"{split}_{i}"
+                make_images(os.path.join(src, split, "images"), count=1)
+                os.replace(os.path.join(src, split, "images", "img1.png"),
+                           os.path.join(src, split, "images", name + ".png"))
+                with open(os.path.join(src, split, "labels", name + ".txt"), "w") as f:
+                    f.write("0 0.5 0.5 0.5 0.5\n")
+                expected[name + ".png"] = split
+        try:
+            summary = di.import_dataset(src, "splitimp")
+            self.assertEqual(summary["splits"], {"train": 2, "valid": 2, "test": 2})
+            from utils import splits
+            store = splits.SplitStore(os.path.join(ctx.root, "vocdataset", "splitimp"))
+            self.assertEqual({n: store.get(n) for n in expected}, expected)
+        finally:
+            wm.delete_workspace("splitimp")
+            shutil.rmtree(src, ignore_errors=True)
+
+    def test_a_flat_folder_has_no_splits_and_stays_all_train(self):
+        src = tempfile.mkdtemp()
+        make_images(src, count=2)
+        try:
+            self.assertIsNone(di.import_dataset(src, "flatimp")["splits"])
+        finally:
+            wm.delete_workspace("flatimp")
+            shutil.rmtree(src, ignore_errors=True)
+
     def test_folder_without_images_is_refused(self):
         with self.assertRaises(ValueError):
             di.import_dataset(tempfile.mkdtemp(), "noimages")
