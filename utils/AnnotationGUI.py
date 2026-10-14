@@ -17,13 +17,12 @@ from .config import (CLASSLIST, state, input_folder, colorsPalette, vocdataset_f
                    class_manager, yolo_dataset_folder, yolo_labels_folder, model_path,
                    model_folder, export_model_folder, export_dataset_folder, workspaceName)
 from . import config as _config_module
-from . import augmentation
-from .augmentation import Augmenter, write_image
-from .augment_geometry import yolo_label_text, voc_xml_write, coco_annotation
+from .ExportDialog import open_export_dialog
 from .file_handler import load_annotation_local
 from .polygon_manager import polygon_manager
 from .inferenceObjectDetection import inference_current, predict_current, apply_predictions, is_heavy
 from . import assistant_modes
+from . import splits as image_splits
 from .AutoAnnotateDialog import run_blocking, open_auto_annotate, confirm_download_if_needed
 from .image_manager import (repeat_last_annotations, delete_current_image, 
                           save_and_backup_bboxes)
@@ -67,6 +66,15 @@ class AnnotationGUI:
             root.destroy()
             return
         
+        # Train / valid / test split per image, and the filters of the image list
+        self.split_store = image_splits.SplitStore(vocdataset_folder)
+        self.class_index = image_splits.ClassIndex(yolo_labels_folder)
+        self.filter_split = None        # None = every split
+        self.filter_classes = set()     # empty = every class
+        self.view = list(self.images)   # the images that pass the filters, in order
+        self._view_set = set(self.view)
+        self._listed = []               # what the image list shows (view + search)
+
         # Variables
         self.current_img_pil = None
         self.canvas_image = None
@@ -721,6 +729,16 @@ class AnnotationGUI:
         self.delete_box_btn = self._kbtn(tool_bar, "Delete box", self.delete_selected_bbox, 'danger')
         self.delete_box_btn.config(state=tk.DISABLED, disabledforeground=C_TXT3)
         self.delete_box_btn.pack(side=tk.LEFT, padx=2, pady=7, ipadx=6)
+        tk.Frame(tool_bar, bg=C_BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y, pady=9, padx=10)
+        tk.Label(tool_bar, text="Split", bg=C_PANEL, fg=C_TXT3,
+                 font=('Segoe UI', 8, 'bold')).pack(side=tk.LEFT)
+        self.split_buttons = {}
+        for key in image_splits.SPLITS:
+            btn = tk.Button(tool_bar, text=image_splits.LABELS[key], command=lambda k=key: self.set_image_split(k),
+                            font=('Segoe UI', 9, 'bold'), relief=tk.FLAT, cursor='hand2', borderwidth=0,
+                            highlightthickness=1)
+            btn.pack(side=tk.LEFT, padx=(6 if key == image_splits.TRAIN else 2, 0), pady=7, ipadx=8)
+            self.split_buttons[key] = btn
         self.tool_hint = tk.Label(tool_bar, text="", bg=C_PANEL, fg=C_TXT3, font=('Segoe UI', 8))
         self.tool_hint.pack(side=tk.RIGHT, padx=12)
         tk.Frame(canvas_container, bg=C_BORDER, height=1).pack(fill=tk.X)
@@ -772,6 +790,29 @@ class AnnotationGUI:
         img_hdr.pack_propagate(False)
         tk.Label(img_hdr, text="📁  IMAGES", bg=C_CARD, fg=C_TXT2,
                  font=('Segoe UI', 8, 'bold')).pack(side=tk.LEFT, padx=10, pady=10)
+
+        # — Filters: split and classes —
+        filter_bar = tk.Frame(right_panel, bg=C_PANEL)
+        filter_bar.pack(fill=tk.X, padx=6, pady=(6, 0))
+        self.filter_split_var = tk.StringVar(value=self.SPLIT_ALL)
+        self.filter_split_combo = ttk.Combobox(
+            filter_bar, textvariable=self.filter_split_var, state='readonly', width=10, font=('Segoe UI', 9),
+            values=[self.SPLIT_ALL] + [image_splits.LABELS[k] for k in image_splits.SPLITS],
+            style='Jelibox.TCombobox')
+        self.filter_split_combo.pack(side=tk.LEFT)
+        self.filter_split_combo.bind('<<ComboboxSelected>>', self.on_filter_split_chosen)
+        self.filter_class_btn = tk.Menubutton(
+            filter_bar, text=self.CLASSES_ALL, anchor='w', font=('Segoe UI', 9), relief=tk.FLAT, padx=8,
+            bg=C_CARD2, fg=C_TXT1, activebackground=C_BORDER, activeforeground=C_TXT1,
+            highlightthickness=1, highlightbackground=C_BORDER, cursor='hand2')
+        self.filter_class_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0), ipady=3)
+        self.filter_class_menu = tk.Menu(
+            self.filter_class_btn, tearoff=0, postcommand=self.rebuild_class_filter_menu,
+            bg=C_CARD2, fg=C_TXT1, activebackground=C_ACCENT, activeforeground=C_ON_ACCENT, selectcolor=C_ACCENT)
+        self.filter_class_btn.config(menu=self.filter_class_menu)
+        self.filter_count_label = tk.Label(right_panel, text="", bg=C_PANEL, fg=C_TXT3, anchor='w',
+                                           justify=tk.LEFT, font=('Segoe UI', 8))
+        self.filter_count_label.pack(fill=tk.X, padx=8, pady=(4, 0))
 
         # — Search bar —
         search_bar = tk.Frame(right_panel, bg=C_CARD2, height=30)
@@ -965,774 +1006,9 @@ class AnnotationGUI:
                     })
         return records
 
-    def _read_coco_annotations(self, xml_path, image_width, image_height, categories):
-        """Convert Jelibox VOC objects into COCO annotation dictionaries."""
-        annotations = []
-        if not os.path.exists(xml_path):
-            return annotations
-
-        try:
-            root = ET.parse(xml_path).getroot()
-        except (ET.ParseError, OSError) as exc:
-            print(f"[COCO] Could not read {xml_path}: {exc}")
-            return annotations
-
-        for obj in root.findall('object'):
-            name_elem = obj.find('name')
-            class_name = (name_elem.text or '').strip() if name_elem is not None else ''
-            if not class_name or class_name not in categories:
-                continue
-
-            polygon = obj.find('polygon')
-            segmentation = []
-            points = []
-            if polygon is not None:
-                point_elements = polygon.findall('point')
-                if point_elements:
-                    for point in point_elements:
-                        x_elem = point.find('x')
-                        y_elem = point.find('y')
-                        if x_elem is not None and y_elem is not None:
-                            points.append((float(x_elem.text), float(y_elem.text)))
-                else:
-                    index = 1
-                    while polygon.find(f'x{index}') is not None and polygon.find(f'y{index}') is not None:
-                        points.append((
-                            float(polygon.find(f'x{index}').text),
-                            float(polygon.find(f'y{index}').text)
-                        ))
-                        index += 1
-
-            if len(points) >= 3:
-                points = [
-                    (max(0.0, min(float(image_width), x)),
-                     max(0.0, min(float(image_height), y)))
-                    for x, y in points
-                ]
-                segmentation = [[coord for point in points for coord in point]]
-                xmin = min(point[0] for point in points)
-                ymin = min(point[1] for point in points)
-                xmax = max(point[0] for point in points)
-                ymax = max(point[1] for point in points)
-                area = 0.5 * abs(sum(
-                    points[index][0] * points[(index + 1) % len(points)][1] -
-                    points[(index + 1) % len(points)][0] * points[index][1]
-                    for index in range(len(points))
-                ))
-            else:
-                bbox = obj.find('bndbox')
-                if bbox is None:
-                    continue
-                xmin = float(bbox.findtext('xmin', '0'))
-                ymin = float(bbox.findtext('ymin', '0'))
-                xmax = float(bbox.findtext('xmax', '0'))
-                ymax = float(bbox.findtext('ymax', '0'))
-                area = max(0.0, xmax - xmin) * max(0.0, ymax - ymin)
-
-            xmin = max(0.0, min(float(image_width), xmin))
-            ymin = max(0.0, min(float(image_height), ymin))
-            xmax = max(xmin, min(float(image_width), xmax))
-            ymax = max(ymin, min(float(image_height), ymax))
-            annotations.append({
-                'category_id': categories[class_name],
-                'bbox': [xmin, ymin, xmax - xmin, ymax - ymin],
-                'area': area,
-                'segmentation': segmentation,
-                'iscrowd': 0
-            })
-
-        return annotations
-
-    def _export_coco_dataset(self, target, train_pct, valid_pct, image_exts, progress_cb=None,
-                             augment=None):
-        """Export indexed workspace images and VOC annotations as COCO JSON."""
-        records = self._find_workspace_images(image_exts)
-        if not records:
-            raise ValueError(f'No images found for workspace {workspaceName} in datasetsInput')
-
-        random.shuffle(records)
-        total = len(records)
-        processed = 0
-        train_count = int(round(total * (train_pct / 100.0)))
-        valid_count = int(round(total * (valid_pct / 100.0)))
-        if train_count + valid_count > total:
-            valid_count = max(0, total - train_count)
-
-        splits = {
-            'train': records[:train_count],
-            'val': records[train_count:train_count + valid_count],
-            'test': records[train_count + valid_count:]
-        }
-        categories = {name: index + 1 for index, name in enumerate(CLASSLIST)}
-        xml_root = vocdataset_folder
-
-        for split_name, split_records in splits.items():
-            image_dir = os.path.join(target, 'images', split_name)
-            os.makedirs(image_dir, exist_ok=True)
-            coco = {
-                'info': {'description': f'Jelibox {workspaceName} dataset'},
-                'licenses': [],
-                'images': [],
-                'annotations': [],
-                'categories': [
-                    {'id': category_id, 'name': name, 'supercategory': 'object'}
-                    for name, category_id in categories.items()
-                ]
-            }
-            annotation_id = 1
-            image_id = 0
-
-            for record in split_records:
-                image_id += 1
-                try:
-                    with Image.open(record['source']) as image:
-                        image_width, image_height = image.size
-                    output_name = record['filename']
-                    destination = os.path.join(image_dir, output_name)
-                    if os.path.exists(destination):
-                        output_name = f"{os.path.basename(os.path.dirname(record['source']))}_{record['filename']}"
-                        destination = os.path.join(image_dir, output_name)
-                    shutil.copy2(record['source'], destination)
-                except (OSError, ValueError) as exc:
-                    print(f"[COCO] Skipping {record['source']}: {exc}")
-                    continue
-
-                coco['images'].append({
-                    'id': image_id,
-                    'file_name': output_name,
-                    'width': image_width,
-                    'height': image_height
-                })
-
-                xml_path = os.path.join(xml_root, record['base'] + '.xml')
-                annotations = self._read_coco_annotations(
-                    xml_path, image_width, image_height, categories)
-                for annotation in annotations:
-                    annotation['id'] = annotation_id
-                    annotation['image_id'] = image_id
-                    coco['annotations'].append(annotation)
-                    annotation_id += 1
-
-                # Photometric copies keep the exact same boxes/polygons
-                if augment is not None:
-                    stem, ext = os.path.splitext(output_name)
-                    for suffix, aug_img, tf in augment.copies(record['source'], split_name):
-                        image_id += 1
-                        aug_name = f"{stem}{suffix}{ext}"
-                        try:
-                            write_image(os.path.join(image_dir, aug_name), aug_img)
-                        except (OSError, ValueError) as exc:
-                            print(f"[COCO] Could not write {aug_name}: {exc}")
-                            image_id -= 1
-                            continue
-                        coco['images'].append({
-                            'id': image_id,
-                            'file_name': aug_name,
-                            'width': aug_img.shape[1],
-                            'height': aug_img.shape[0]
-                        })
-                        for annotation in annotations:
-                            clone = copy.deepcopy(annotation) if tf is None else coco_annotation(annotation, tf)
-                            clone['id'] = annotation_id
-                            clone['image_id'] = image_id
-                            coco['annotations'].append(clone)
-                            annotation_id += 1
-
-                processed += 1
-                if progress_cb:
-                    progress_cb(processed, total, f'Exporting COCO... {processed}/{total}')
-
-            annotation_dir = os.path.join(target, 'annotations')
-            os.makedirs(annotation_dir, exist_ok=True)
-            json_path = os.path.join(annotation_dir, f'instances_{split_name}.json')
-            with open(json_path, 'w', encoding='utf-8') as json_file:
-                json.dump(coco, json_file, indent=2)
-
-        return target
-
-    def _export_yolo_dataset(self, target, train_pct, valid_pct, image_exts, progress_cb=None,
-                             augment=None):
-        """Export the workspace's YOLO labels as a train/val/test split, pulling
-        source images straight from datasetsInput (never from a copied folder)."""
-        records = self._find_workspace_images(image_exts)
-        images_by_base = {r['base']: r['source'] for r in records}
-
-        label_files = [f for f in os.listdir(yolo_labels_folder) if f.endswith('.txt')] \
-            if os.path.isdir(yolo_labels_folder) else []
-        pairs = [(images_by_base[base], base + '.txt')
-                 for base in (os.path.splitext(f)[0] for f in label_files)
-                 if base in images_by_base]
-
-        if not pairs:
-            raise ValueError(f'No labeled images found for workspace {workspaceName}')
-
-        random.shuffle(pairs)
-        n = len(pairs)
-        n_train = int(round(n * (train_pct / 100.0)))
-        n_valid = int(round(n * (valid_pct / 100.0)))
-        if n_train + n_valid > n:
-            n_valid = max(0, n - n_train)
-        splits = {
-            'train': pairs[:n_train],
-            'val': pairs[n_train:n_train + n_valid],
-            'test': pairs[n_train + n_valid:]
-        }
-
-        processed = 0
-        for split_name, split_pairs in splits.items():
-            out_images = os.path.join(target, split_name, 'images')
-            out_labels = os.path.join(target, split_name, 'labels')
-            os.makedirs(out_images, exist_ok=True)
-            os.makedirs(out_labels, exist_ok=True)
-            for img_src, lbl_name in split_pairs:
-                try:
-                    shutil.copy2(img_src, os.path.join(out_images, os.path.basename(img_src)))
-                except Exception:
-                    pass
-                try:
-                    shutil.copy2(os.path.join(yolo_labels_folder, lbl_name),
-                                 os.path.join(out_labels, lbl_name))
-                except Exception:
-                    pass
-
-                # Augmented copies: photometric ones reuse the label as is, flips/rotations move it
-                if augment is not None:
-                    stem, ext = os.path.splitext(os.path.basename(img_src))
-                    for suffix, aug_img, tf in augment.copies(img_src, split_name):
-                        try:
-                            write_image(os.path.join(out_images, f"{stem}{suffix}{ext}"), aug_img)
-                            label_src = os.path.join(yolo_labels_folder, lbl_name)
-                            label_dst = os.path.join(out_labels, f"{stem}{suffix}.txt")
-                            if tf is None:
-                                shutil.copy2(label_src, label_dst)
-                            else:
-                                with open(label_src, encoding='utf-8') as f:
-                                    moved = yolo_label_text(f.read(), tf)
-                                with open(label_dst, 'w', encoding='utf-8') as f:
-                                    f.write(moved)
-                        except Exception as exc:
-                            print(f"[YOLO] Could not write augmented copy of {stem}: {exc}")
-
-                processed += 1
-                if progress_cb:
-                    progress_cb(processed, n, f'Exporting YOLO... {processed}/{n}')
-
-        try:
-            data_yml = os.path.join(target, 'data.yml')
-            with open(data_yml, 'w') as fy:
-                fy.write(f"train: {os.path.abspath(os.path.join(target, 'train', 'images'))}\n")
-                fy.write(f"val:   {os.path.abspath(os.path.join(target, 'val', 'images'))}\n")
-                fy.write(f"test:  {os.path.abspath(os.path.join(target, 'test', 'images'))}\n")
-                fy.write(f"nc:    {len(CLASSLIST)}\n")
-                fy.write('names:\n')
-                for i, name in enumerate(CLASSLIST):
-                    fy.write(f"  {i}: {name}\n")
-        except Exception:
-            pass
-
-        return target
-
-    def _export_voc_dataset(self, target, train_pct, valid_pct, image_exts, progress_cb=None,
-                            augment=None):
-        """Export indexed workspace images and their VOC XML annotations."""
-        images_found = [r['source'] for r in self._find_workspace_images(image_exts)]
-
-        if not images_found:
-            raise ValueError(f'No images found for workspace {workspaceName} in datasetsInput')
-
-        random.shuffle(images_found)
-        n = len(images_found)
-        n_train = int(round(n * (train_pct / 100.0)))
-        n_valid = int(round(n * (valid_pct / 100.0)))
-        if n_train + n_valid > n:
-            n_valid = max(0, n - n_train)
-
-        train_imgs = images_found[:n_train]
-        valid_imgs = images_found[n_train:n_train + n_valid]
-        test_imgs = images_found[n_train + n_valid:]
-
-        processed = 0
-        for split_name, imgs_list in (('train', train_imgs), ('valid', valid_imgs), ('test', test_imgs)):
-            out_dir = os.path.join(target, split_name)
-            os.makedirs(out_dir, exist_ok=True)
-            for img_path in imgs_list:
-                try:
-                    shutil.copy2(img_path, os.path.join(out_dir, os.path.basename(img_path)))
-                except Exception:
-                    pass
-                base = os.path.splitext(os.path.basename(img_path))[0]
-                xml_path = os.path.join(vocdataset_folder, base + '.xml')
-                if os.path.exists(xml_path):
-                    try:
-                        shutil.copy2(xml_path, os.path.join(out_dir, base + '.xml'))
-                    except Exception:
-                        pass
-
-                # Augmented copies: same objects (moved with the image for flips/rotations)
-                if augment is not None:
-                    img_stem, img_ext = os.path.splitext(os.path.basename(img_path))
-                    for suffix, aug_img, tf in augment.copies(img_path, split_name):
-                        aug_name = f"{img_stem}{suffix}{img_ext}"
-                        try:
-                            write_image(os.path.join(out_dir, aug_name), aug_img)
-                            if os.path.exists(xml_path):
-                                voc_xml_write(xml_path, os.path.join(out_dir, f"{img_stem}{suffix}.xml"),
-                                              aug_name, tf)
-                        except Exception as exc:
-                            print(f"[VOC] Could not write augmented copy of {img_stem}: {exc}")
-
-                processed += 1
-                if progress_cb:
-                    progress_cb(processed, n, f'Exporting Pascal VOC... {processed}/{n}')
-
-        return target
-
     def show_export_dataset_dialog(self):
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Export Dataset")
-        dialog.geometry("560x395")
-        dialog.configure(bg=C_BASE)
-        dialog.transient(self.root)
-        dialog.grab_set()
-        dialog.resizable(False, False)
-
-        dialog.update_idletasks()
-        x = (dialog.winfo_screenwidth() // 2) - (dialog.winfo_width() // 2)
-        y = max(0, (dialog.winfo_screenheight() // 2) - 330)
-        dialog.geometry(f"+{x}+{y}")
-
-        body = tk.Frame(dialog, bg=C_CARD, padx=12, pady=12)
-        body.pack(fill=tk.BOTH, expand=True)
-
-        # Format dropdown
-        tk.Label(body, text="Format:", bg=C_CARD, fg=C_TXT1).pack(anchor='w')
-        fmt_var = tk.StringVar(value='YOLO')
-        fmt_combo = ttk.Combobox(body, values=["YOLO", "Pascal VOC (XML)", "COCO"], state='readonly', font=('Segoe UI', 10))
-        fmt_combo.set('YOLO')
-        fmt_combo.pack(fill=tk.X, pady=(0,8))
-
-        # Split slider area (two separators define train/valid/test)
-        tk.Label(body, text="Split (Train / Valid / Test):", bg=C_CARD, fg=C_TXT1).pack(anchor='w')
-
-        slider_w = 460
-        slider_h = 60
-        slider_canvas = tk.Canvas(body, width=slider_w, height=slider_h, bg=C_CARD, highlightthickness=0)
-        slider_canvas.pack(pady=(4,8))
-
-        # initial separators (px)
-        left_x = int(slider_w * 0.7)
-        right_x = int(slider_w * 0.9)
-
-        bar_y = slider_h // 2
-        bar_h = 10
-        # draw bar
-        slider_canvas.create_rectangle(10, bar_y - bar_h//2, slider_w - 10, bar_y + bar_h//2, fill=C_CARD2, outline='')
-
-        handle_radius = 8
-        handle1 = slider_canvas.create_oval(left_x - handle_radius, bar_y - handle_radius,
-                                            left_x + handle_radius, bar_y + handle_radius,
-                                            fill=C_ACCENT, outline='')
-        handle2 = slider_canvas.create_oval(right_x - handle_radius, bar_y - handle_radius,
-                                            right_x + handle_radius, bar_y + handle_radius,
-                                            fill=C_ACCENT, outline='')
-
-        # percent labels above centers
-        train_lbl = slider_canvas.create_text(0, 12, text='', fill=C_TXT1, font=('Segoe UI', 9, 'bold'))
-        valid_lbl = slider_canvas.create_text(0, 12, text='', fill=C_TXT1, font=('Segoe UI', 9, 'bold'))
-        test_lbl = slider_canvas.create_text(0, 12, text='', fill=C_TXT1, font=('Segoe UI', 9, 'bold'))
-
-        def update_labels():
-            coords1 = slider_canvas.coords(handle1)
-            coords2 = slider_canvas.coords(handle2)
-            x1 = (coords1[0] + coords1[2]) / 2
-            x2 = (coords2[0] + coords2[2]) / 2
-            left = 10
-            right = slider_w - 10
-            total = right - left
-            train_pct = round(((x1 - left) / total) * 100)
-            valid_pct = round(((x2 - x1) / total) * 100)
-            test_pct = 100 - train_pct - valid_pct
-
-            # ensure bounds
-            if train_pct < 0:
-                train_pct = 0
-            if valid_pct < 0:
-                valid_pct = 0
-
-            # positions for labels (center of ranges)
-            train_cx = left + (x1 - left) / 2
-            valid_cx = x1 + (x2 - x1) / 2
-            test_cx = x2 + (right - x2) / 2
-
-            slider_canvas.coords(train_lbl, train_cx, 12)
-            slider_canvas.coords(valid_lbl, valid_cx, 12)
-            slider_canvas.coords(test_lbl, test_cx, 12)
-
-            slider_canvas.itemconfig(train_lbl, text=f"{train_pct}%")
-            slider_canvas.itemconfig(valid_lbl, text=f"{valid_pct}%")
-            slider_canvas.itemconfig(test_lbl, text=f"{test_pct}%")
-
-            train_var.set(str(train_pct))
-            valid_var.set(str(valid_pct))
-            test_var.set(str(test_pct))
-
-        # Dragging logic
-        drag_data = {'item': None}
-        export_state = {'active': False}
-
-        def on_press(event):
-            if export_state['active']:
-                return
-            item = slider_canvas.find_closest(event.x, event.y)[0]
-            if item in (handle1, handle2):
-                drag_data['item'] = item
-
-        def on_release(event):
-            drag_data['item'] = None
-
-        def on_motion(event):
-            item = drag_data.get('item')
-            if not item:
-                return
-            x = event.x
-            left = 10
-            right = slider_w - 10
-            # enforce ordering
-            coords1 = slider_canvas.coords(handle1)
-            coords2 = slider_canvas.coords(handle2)
-            x1 = (coords1[0] + coords1[2]) / 2
-            x2 = (coords2[0] + coords2[2]) / 2
-            min_gap = 4
-            if item == handle1:
-                x = max(left, min(x, x2 - min_gap))
-                slider_canvas.coords(handle1, x - handle_radius, bar_y - handle_radius, x + handle_radius, bar_y + handle_radius)
-            else:
-                x = min(right, max(x, x1 + min_gap))
-                slider_canvas.coords(handle2, x - handle_radius, bar_y - handle_radius, x + handle_radius, bar_y + handle_radius)
-            update_labels()
-
-        slider_canvas.bind('<Button-1>', on_press)
-        slider_canvas.bind('<B1-Motion>', on_motion)
-        slider_canvas.bind('<ButtonRelease-1>', on_release)
-
-        # numeric readouts / spinboxes
-        readout_row = tk.Frame(body, bg=C_CARD)
-        readout_row.pack(fill=tk.X)
-
-        # Use StringVar to avoid Tcl numeric parsing errors when user types invalid numeric strings
-        train_var = tk.StringVar(value=str(round((left_x - 10) / (slider_w - 20) * 100)))
-        valid_var = tk.StringVar(value=str(round((right_x - left_x) / (slider_w - 20) * 100)))
-        test_var = tk.StringVar(value='0')
-
-        def safe_to_int(s):
-            if s is None:
-                return 0
-            # keep only digits
-            s2 = ''.join(ch for ch in str(s) if ch.isdigit())
-            if s2 == '':
-                return 0
-            try:
-                return int(s2)
-            except Exception:
-                return 0
-
-        def on_spin_change(*a):
-            t = max(0, min(100, safe_to_int(train_var.get())))
-            v = max(0, min(100 - t, safe_to_int(valid_var.get())))
-            train_var.set(str(t))
-            valid_var.set(str(v))
-            test_var.set(str(100 - t - v))
-            # update handles
-            left = 10
-            right = slider_w - 10
-            total = right - left
-            new_x1 = left + (t / 100.0) * total
-            new_x2 = new_x1 + (v / 100.0) * total
-            slider_canvas.coords(handle1, new_x1 - handle_radius, bar_y - handle_radius, new_x1 + handle_radius, bar_y + handle_radius)
-            slider_canvas.coords(handle2, new_x2 - handle_radius, bar_y - handle_radius, new_x2 + handle_radius, bar_y + handle_radius)
-            update_labels()
-
-        tk.Label(readout_row, text='Train %', bg=C_CARD, fg=C_TXT2).grid(row=0, column=0, padx=6)
-        tk.Label(readout_row, text='Valid %', bg=C_CARD, fg=C_TXT2).grid(row=0, column=1, padx=6)
-        tk.Label(readout_row, text='Test %', bg=C_CARD, fg=C_TXT2).grid(row=0, column=2, padx=6)
-
-        sb_train = tk.Spinbox(readout_row, from_=0, to=100, textvariable=train_var, width=6, command=on_spin_change)
-        sb_valid = tk.Spinbox(readout_row, from_=0, to=100, textvariable=valid_var, width=6, command=on_spin_change)
-        sb_train.grid(row=1, column=0, padx=6)
-        sb_valid.grid(row=1, column=1, padx=6)
-        tk.Label(readout_row, textvariable=test_var, bg=C_CARD, fg=C_TXT1, width=6).grid(row=1, column=2, padx=6)
-
-        # initialize labels
-        update_labels()
-
-        # Ensure typing into spinboxes updates values immediately
-        try:
-            train_var.trace_add('write', lambda *a: on_spin_change())
-            valid_var.trace_add('write', lambda *a: on_spin_change())
-        except Exception:
-            train_var.trace('w', lambda *a: on_spin_change())
-            valid_var.trace('w', lambda *a: on_spin_change())
-
-        # ---- Augmentation (photometric) ---------------------------------
-        aug_enabled = tk.BooleanVar(value=False)
-        aug_widgets = []          # everything that must lock while exporting
-        aug_op_vars = {}          # op name -> (enabled, magnitude, probability) tk variables
-        base_height, panel_height = 395, 370
-
-        aug_panel = tk.Frame(body, bg=C_CARD)
-
-        def toggle_aug_panel():
-            if aug_enabled.get():
-                aug_panel.pack(fill=tk.X, after=aug_toggle, pady=(2, 0))
-                height = base_height + panel_height
-            else:
-                aug_panel.pack_forget()
-                height = base_height
-            top = max(0, (dialog.winfo_screenheight() - height) // 2 - 20)
-            dialog.geometry(f"560x{height}+{dialog.winfo_x()}+{top}")
-
-        aug_toggle = tk.Checkbutton(
-            body, text="Augment exported images (random, after the split)",
-            variable=aug_enabled, command=toggle_aug_panel, bg=C_CARD, fg=C_TXT1,
-            selectcolor=C_CARD2, activebackground=C_CARD, activeforeground=C_TXT1,
-            anchor='w', font=('Segoe UI', 9, 'bold'))
-        aug_toggle.pack(fill=tk.X, pady=(6, 0))
-        aug_widgets.append(aug_toggle)
-
-        aug_tabs = ttk.Notebook(aug_panel)
-        aug_tabs.pack(fill=tk.X, pady=(2, 0))
-        tab_frames = {}
-        tab_titles = {'color': 'Color & quality', 'geometry': 'Flip & rotate'}
-        next_row = {}
-        for group in tab_titles:
-            grid = tk.Frame(aug_tabs, bg=C_CARD, padx=4, pady=4)
-            aug_tabs.add(grid, text=tab_titles[group])
-            for col, text in ((0, 'Effect'), (1, 'Value'), (3, 'Chance')):
-                tk.Label(grid, text=text, bg=C_CARD, fg=C_TXT2, anchor='w',
-                         font=('Segoe UI', 9, 'bold')).grid(row=0, column=col, sticky='w', padx=(4, 8))
-            grid.grid_columnconfigure(0, minsize=170)
-            grid.grid_columnconfigure(1, minsize=62)
-            grid.grid_columnconfigure(2, minsize=44)
-            tab_frames[group] = grid
-            next_row[group] = 1
-
-        def refresh_tab_titles(*_):
-            for index, group in enumerate(tab_titles):
-                count = sum(1 for n, (on_, _m, _p) in aug_op_vars.items()
-                            if augmentation.OPERATIONS[n]['group'] == group and on_.get())
-                aug_tabs.tab(index, text=tab_titles[group] + (f'  ({count})' if count else ''))
-
-        for op_name, spec in augmentation.OPERATIONS.items():
-            grid, row = tab_frames[spec['group']], next_row[spec['group']]
-            next_row[spec['group']] += 1
-            on = tk.BooleanVar(value=op_name in ('brightness', 'blur'))
-            mag = tk.StringVar(value=str(spec['default']))
-            prob = tk.StringVar(value='50')
-            aug_op_vars[op_name] = (on, mag, prob)
-            on.trace_add('write', refresh_tab_titles)
-            cb = tk.Checkbutton(grid, text=spec['label'], variable=on, anchor='w',
-                                bg=C_CARD, fg=C_TXT1, selectcolor=C_CARD2,
-                                activebackground=C_CARD, activeforeground=C_TXT1)
-            cb.grid(row=row, column=0, sticky='w')
-            aug_widgets.append(cb)
-            lo, hi = spec['range']
-            if hi > 0:
-                sm = tk.Spinbox(grid, from_=lo, to=hi, textvariable=mag, width=5)
-                sm.grid(row=row, column=1, sticky='w', padx=(4, 0))
-                aug_widgets.append(sm)
-                tk.Label(grid, text=spec['unit'], bg=C_CARD, fg=C_TXT3,
-                         anchor='w').grid(row=row, column=2, sticky='w', padx=(2, 8))
-            else:
-                tk.Label(grid, text=spec.get('fixed_note', '-'), bg=C_CARD, fg=C_TXT3,
-                         anchor='w').grid(row=row, column=1, columnspan=2, sticky='w', padx=(4, 0))
-            sp = tk.Spinbox(grid, from_=1, to=100, textvariable=prob, width=5)
-            sp.grid(row=row, column=3, sticky='w', padx=(4, 0))
-            aug_widgets.append(sp)
-            tk.Label(grid, text='%', bg=C_CARD, fg=C_TXT3).grid(row=row, column=4, sticky='w', padx=(2, 0))
-        refresh_tab_titles()
-
-        aug_opts = tk.Frame(aug_panel, bg=C_CARD)
-        aug_opts.pack(fill=tk.X, pady=(8, 0))
-        copies_var = tk.StringVar(value='1')
-        seed_var = tk.StringVar(value='')
-        aug_valid = tk.BooleanVar(value=False)
-        aug_test = tk.BooleanVar(value=False)
-        tk.Label(aug_opts, text='Copies per image', bg=C_CARD, fg=C_TXT1, anchor='w'
-                 ).grid(row=0, column=0, sticky='w', padx=(4, 6))
-        sc = tk.Spinbox(aug_opts, from_=1, to=10, textvariable=copies_var, width=5)
-        sc.grid(row=0, column=1, sticky='w')
-        tk.Label(aug_opts, text='Seed (optional)', bg=C_CARD, fg=C_TXT1, anchor='w'
-                 ).grid(row=0, column=2, sticky='w', padx=(18, 6))
-        se = tk.Entry(aug_opts, textvariable=seed_var, width=9)
-        se.grid(row=0, column=3, sticky='w')
-        tk.Label(aug_opts, text='Also augment (train always is)', bg=C_CARD, fg=C_TXT1, anchor='w'
-                 ).grid(row=1, column=0, columnspan=2, sticky='w', padx=(4, 6), pady=(3, 0))
-        also = tk.Frame(aug_opts, bg=C_CARD)
-        also.grid(row=1, column=2, columnspan=2, sticky='w', pady=(3, 0))
-        cv_ = tk.Checkbutton(also, text='Valid', variable=aug_valid, bg=C_CARD, fg=C_TXT1,
-                             selectcolor=C_CARD2, activebackground=C_CARD, activeforeground=C_TXT1)
-        cv_.pack(side=tk.LEFT)
-        ct_ = tk.Checkbutton(also, text='Test', variable=aug_test, bg=C_CARD, fg=C_TXT1,
-                             selectcolor=C_CARD2, activebackground=C_CARD, activeforeground=C_TXT1)
-        ct_.pack(side=tk.LEFT, padx=(8, 0))
-        aug_widgets.extend([sc, se, cv_, ct_])
-
-        def build_augment_config():
-            """Read the panel into an AugmentConfig; returns (config, error message)."""
-            ops = {}
-            for op_name, (on, mag, prob) in aug_op_vars.items():
-                spec = augmentation.OPERATIONS[op_name]
-                lo, hi = spec['range']
-                magnitude = max(lo, min(hi, safe_to_int(mag.get()))) if hi > 0 else spec['default']
-                probability = max(1, min(100, safe_to_int(prob.get())))
-                ops[op_name] = augmentation.OpSetting(on.get(), magnitude, probability)
-            if not any(s.enabled for s in ops.values()):
-                return None, 'Tick at least one augmentation, or untick "Augment exported images".'
-            seed_text = seed_var.get().strip()
-            if seed_text and not seed_text.lstrip('-').isdigit():
-                return None, 'Seed must be a whole number (or empty).'
-            splits = ['train'] + (['val'] if aug_valid.get() else []) + (['test'] if aug_test.get() else [])
-            cfg = augmentation.AugmentConfig(
-                ops=ops,
-                copies=max(1, min(10, safe_to_int(copies_var.get()))),
-                splits=tuple(splits),
-                seed=int(seed_text) if seed_text else None)
-            return cfg, None
-
-        status_lbl = tk.Label(body, text='', bg=C_CARD, fg=C_TXT1)
-        status_lbl.pack(fill=tk.X, pady=(8,0))
-
-        progress_bar = ttk.Progressbar(body, orient='horizontal', mode='determinate', maximum=100)
-        progress_bar.pack(fill=tk.X, pady=(4,0))
-
-        dialog.geometry(f"560x{base_height}")
-
-        def set_ui_locked(locked):
-            export_state['active'] = locked
-            state = 'disabled' if locked else 'readonly'
-            fmt_combo.config(state=state)
-            for w in aug_widgets:
-                w.config(state='disabled' if locked else 'normal')
-            sb_train.config(state='disabled' if locked else 'normal')
-            sb_valid.config(state='disabled' if locked else 'normal')
-            export_btn.config(state='disabled' if locked else 'normal')
-            close_btn.config(state='disabled' if locked else 'normal')
-
-        def on_dialog_close():
-            if export_state['active']:
-                return
-            dialog.destroy()
-
-        dialog.protocol("WM_DELETE_WINDOW", on_dialog_close)
-
-        def do_export_dataset():
-            if export_state['active']:
-                return
-
-            fmt = fmt_combo.get()
-            t = safe_to_int(train_var.get())
-            v = safe_to_int(valid_var.get())
-            te = 100 - t - v
-            if t + v + te != 100:
-                messagebox.showerror('Invalid Split', 'Train+Valid+Test must equal 100%', parent=dialog)
-                return
-
-            image_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp')
-
-            augmenter = None
-            seed = None
-            if aug_enabled.get():
-                aug_config, problem = build_augment_config()
-                if problem:
-                    messagebox.showerror('Augmentation', problem, parent=dialog)
-                    return
-                augmenter = Augmenter(aug_config)
-                seed = aug_config.seed
-
-            set_ui_locked(True)
-            progress_bar['value'] = 0
-            status_lbl.config(text='Preparing export...')
-            # Force an immediate repaint so the locked/0% state is visible right away,
-            # instead of only appearing once the (possibly very fast) worker finishes.
-            dialog.update_idletasks()
-
-            last_pct = {'value': -1}
-
-            def progress_cb(current, total, message=None):
-                def update():
-                    pct = int((current / total) * 100) if total else 0
-                    progress_bar['value'] = pct
-                    status_lbl.config(text=message or f'Exporting... {pct}%')
-                    # Small/fast exports can finish within a single Tk event-loop
-                    # iteration, so queued updates never get painted before the
-                    # completion dialog takes over. Force a repaint whenever the
-                    # displayed percentage actually changes so progress is visible
-                    # without adding per-file overhead on large datasets.
-                    if pct != last_pct['value']:
-                        last_pct['value'] = pct
-                        progress_bar.update_idletasks()
-                self.root.after(0, update)
-
-            def worker():
-                try:
-                    target = export_dataset_folder
-                    # If the target exists, remove it to avoid mixing previous exports
-                    try:
-                        if os.path.exists(target):
-                            # Safety: ensure target is inside project folder to avoid accidental deletes
-                            proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-                            abs_target = os.path.abspath(target)
-                            if abs_target.startswith(proj_root):
-                                shutil.rmtree(abs_target)
-                            else:
-                                # If target is outside project, don't auto-delete; just create subfolder with timestamp
-                                target = os.path.join(target, f'export_{int(time.time())}')
-                        os.makedirs(target, exist_ok=True)
-                    except Exception:
-                        os.makedirs(target, exist_ok=True)
-
-                    if seed is not None:
-                        random.seed(seed)       # makes the train/val/test shuffle repeatable too
-
-                    if fmt == 'YOLO':
-                        self._export_yolo_dataset(target, t, v, image_exts, progress_cb, augment=augmenter)
-                    elif 'Pascal' in fmt or 'XML' in fmt:
-                        self._export_voc_dataset(target, t, v, image_exts, progress_cb, augment=augmenter)
-                    elif fmt == 'COCO':
-                        self._export_coco_dataset(target, t, v, image_exts, progress_cb, augment=augmenter)
-                    else:
-                        raise ValueError(f'Unknown format: {fmt}')
-
-                    extra = ''
-                    if augmenter is not None:
-                        extra = f'\n\nAugmented copies added: {augmenter.created}'
-                        if augmenter.skipped:
-                            extra += f' ({augmenter.skipped} skipped: no effect fired)'
-
-                    def on_success():
-                        set_ui_locked(False)
-                        progress_bar['value'] = 100
-                        status_lbl.config(text=f'Export completed to: {target}')
-                        messagebox.showinfo('Export Completed', f'Dataset exported to:\n{target}{extra}', parent=dialog)
-                    self.root.after(0, on_success)
-
-                except Exception as e:
-                    err = str(e)
-                    def on_error():
-                        set_ui_locked(False)
-                        progress_bar['value'] = 0
-                        status_lbl.config(text='Export failed')
-                        messagebox.showerror('Export Failed', f'Error during export:\n{err}', parent=dialog)
-                    self.root.after(0, on_error)
-
-            threading.Thread(target=worker, daemon=True).start()
-
-        btn_row = tk.Frame(body, bg=C_CARD)
-        btn_row.pack(fill=tk.X, pady=(8,0))
-        export_btn = tk.Button(btn_row, text='Export', command=do_export_dataset, bg=C_ACCENT, fg=C_ON_ACCENT)
-        export_btn.pack(side=tk.RIGHT, padx=6)
-        close_btn = tk.Button(btn_row, text='Close', command=on_dialog_close, bg=C_CARD2, fg=C_TXT1)
-        close_btn.pack(side=tk.RIGHT, padx=(0,6))
+        self.save_current()        # the export reads the label files, so the open image must be on disk
+        open_export_dialog(self)
 
     # ----------------------------------------------------------
     #  Add / Delete class dialogs
@@ -2159,6 +1435,7 @@ class AnnotationGUI:
         if hasattr(self, 'visibility_count_labels'):
             self.update_visibility_counts()
         self.refresh_layers()
+        self.update_split_ui()
 
         # Update bottom status bar progress
         if hasattr(self, 'statusbar_progress'):
@@ -2170,37 +1447,49 @@ class AnnotationGUI:
     # ----------------------------------------------------------
     #  Image list
     # ----------------------------------------------------------
+    SPLIT_ALL = "All splits"
+    CLASSES_ALL = "All classes  ▾"
+    SPLIT_TAGS = {image_splits.TRAIN: "TRN", image_splits.VALID: "VAL", image_splits.TEST: "TST"}
+    SPLIT_COLORS = {image_splits.TRAIN: C_GREEN, image_splits.VALID: C_AMBER, image_splits.TEST: C_ACCENT}
+
+    def rebuild_view(self):
+        """The images that pass the split and class filters."""
+        self.view = image_splits.matching(self.images, self.split_store, self.class_index,
+                                          class_manager.get_classes(), self.filter_split, sorted(self.filter_classes))
+        self._view_set = set(self.view)
+
     def refresh_image_list(self):
-        self.all_images_for_search = self.images.copy()
+        self.rebuild_view()
+        self.all_images_for_search = self.view
         self.on_image_search_change()
+        counts = self.split_store.counts(self.images)
+        shown = f"Showing {len(self.view)} of {len(self.images)}" if (self.filter_split or self.filter_classes) \
+            else f"{len(self.images)} images"
+        self.filter_count_label.config(
+            text=f"{shown}\n" + "  ·  ".join(f"{image_splits.LABELS[k]} {counts[k]}" for k in image_splits.SPLITS))
 
     def on_image_search_change(self, *args):
         search_term = self.image_search_var.get().lower()
         if search_term.strip():
-            filtered = [img for img in self.all_images_for_search
-                        if search_term in img.lower()]
+            self._listed = [img for img in self.all_images_for_search if search_term in img.lower()]
         else:
-            filtered = self.all_images_for_search
+            self._listed = list(self.all_images_for_search)
 
         self.image_listbox.delete(0, tk.END)
-        for img in filtered:
-            self.image_listbox.insert(tk.END, img)
+        for img in self._listed:
+            self.image_listbox.insert(tk.END, f"{self.SPLIT_TAGS[self.split_store.get(img)]}  {img}")
 
         current_img = self.images[state.current_index] if self.images else None
-        if current_img:
-            try:
-                idx = filtered.index(current_img)
-                self.image_listbox.select_set(idx)
-                self.image_listbox.see(idx)
-            except ValueError:
-                pass
+        if current_img in self._listed:
+            idx = self._listed.index(current_img)
+            self.image_listbox.select_set(idx)
+            self.image_listbox.see(idx)
 
     def on_image_select(self, event):
         selection = self.image_listbox.curselection()
-        if not selection:
+        if not selection or selection[0] >= len(self._listed):
             return
-        idx = selection[0]
-        selected_img = self.image_listbox.get(idx)
+        selected_img = self._listed[selection[0]]
         try:
             actual_idx = self.images.index(selected_img)
         except ValueError:
@@ -2212,6 +1501,91 @@ class AnnotationGUI:
         self.load_current_image()
         self.update_display()
         print(f"[GUI] Loaded image from list: {selected_img}")
+
+    # ----------------------------------------------------------
+    #  Split of the current image, and the filters
+    # ----------------------------------------------------------
+    def update_split_ui(self):
+        """Colour the split button of the current image; the others stay neutral."""
+        if not hasattr(self, 'split_buttons') or not self.images:
+            return
+        current = self.split_store.get(self.images[state.current_index])
+        for key, btn in self.split_buttons.items():
+            on = key == current
+            bg = self.SPLIT_COLORS[key] if on else C_CARD2
+            fg = self._readable_fg(bg) if on else C_TXT1
+            btn.config(bg=bg, fg=fg, activebackground=bg if on else C_BORDER, activeforeground=fg,
+                       highlightbackground=bg if on else C_BORDER)
+
+    def _neighbour(self, delta):
+        """Index in self.images of the next (delta=1) or previous (-1) image that passes the filters, wrapping
+        around; None when no other image passes."""
+        n = len(self.images)
+        for k in range(1, n):
+            j = (state.current_index + delta * k) % n
+            if self.images[j] in self._view_set:
+                return j
+        return None
+
+    def _go_to(self, index):
+        self.save_current()
+        if index is not None:
+            state.current_index = index
+        self.load_current_image()
+        self.update_display()
+
+    def set_image_split(self, split):
+        name = self.images[state.current_index]
+        if self.split_store.get(name) == split:
+            return
+        self.split_store.set(name, split)
+        target = None
+        if self.filter_split and self.filter_split != split:
+            target = self._neighbour(1)            # it left the filtered set: carry on with the next one
+        if target is not None:
+            self._go_to(target)
+        self.refresh_image_list()
+        self.update_split_ui()
+        print(f"[GUI] {name} -> {image_splits.LABELS[split]} split")
+
+    def on_filter_split_chosen(self, event=None):
+        chosen = self.filter_split_var.get()
+        self.filter_split = next((k for k, v in image_splits.LABELS.items() if v == chosen), None)
+        self.apply_filters()
+
+    def rebuild_class_filter_menu(self):
+        menu = self.filter_class_menu
+        menu.delete(0, tk.END)
+        classes = class_manager.get_classes()
+        self.filter_classes &= set(classes)
+        menu.add_command(label="All classes", command=self.clear_class_filter)
+        menu.add_separator()
+        self._class_filter_vars = {}
+        for cls in classes:
+            var = tk.BooleanVar(value=cls in self.filter_classes)
+            self._class_filter_vars[cls] = var
+            menu.add_checkbutton(label=cls, variable=var, command=self.on_class_filter_toggled)
+
+    def clear_class_filter(self):
+        self.filter_classes = set()
+        self.apply_filters()
+
+    def on_class_filter_toggled(self):
+        self.filter_classes = {c for c, v in self._class_filter_vars.items() if v.get()}
+        self.apply_filters()
+
+    def apply_filters(self):
+        """After a filter changed: relist, and move to the nearest image that passes when the current one does not."""
+        names = sorted(self.filter_classes)
+        self.filter_class_btn.config(
+            text=self.CLASSES_ALL if not names else (f"{names[0]}  ▾" if len(names) == 1 else f"{names[0]} +{len(names) - 1}  ▾"))
+        self.save_current()                        # the class filter reads the saved label files
+        self.refresh_image_list()
+        if self.view and self.images[state.current_index] not in self._view_set:
+            self._go_to(self._neighbour(1))
+        else:
+            self.update_display()
+        self.update_split_ui()
 
     # ----------------------------------------------------------
     #  Mouse interaction
@@ -3172,16 +2546,10 @@ class AnnotationGUI:
     #  Image navigation
     # ----------------------------------------------------------
     def next_image(self):
-        self.save_current()
-        state.current_index = (state.current_index + 1) % len(self.images)
-        self.load_current_image()
-        self.update_display()
+        self._go_to(self._neighbour(1))
 
     def prev_image(self):
-        self.save_current()
-        state.current_index = (state.current_index - 1) % len(self.images)
-        self.load_current_image()
-        self.update_display()
+        self._go_to(self._neighbour(-1))
 
     def save_current(self):
         """Save current annotations - force zoom to 1x (normalized scale) first"""
@@ -3807,6 +3175,7 @@ class AnnotationGUI:
                 self.root.destroy()
                 return
             state.current_index, self.images = result
+            self.split_store.forget(img_name)
             self.load_current_image()
             self.update_display()
             self.refresh_image_list()

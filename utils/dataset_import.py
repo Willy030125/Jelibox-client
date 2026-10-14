@@ -32,6 +32,7 @@ import shutil
 import xml.etree.ElementTree as ET
 
 from . import workspace_config
+from . import splits as image_splits
 from .workspace_manager import (
     DATASETS_ROOT, CONFIGS_ROOT, BASE_DIR, IMAGE_EXTENSIONS,
     next_instance_name, existing_classes_for_workspace,
@@ -70,9 +71,10 @@ def scan_dataset_folder(root_folder):
         'yolo': {basename: path},         # .txt, excluding class-list files
         'coco': [path, ...],              # .json that look like COCO
         'yolo_classes_file': path or None,  # classes.txt / obj.names / data.yaml
+        'splits': {basename: 'train'|'valid'|'test'},  # from folders named train / valid / val / test
       }
     """
-    images, voc, yolo, coco = {}, {}, {}, []
+    images, voc, yolo, coco, splits = {}, {}, {}, [], {}
     yolo_classes_file = None
 
     for path in _walk_files(root_folder):
@@ -82,6 +84,9 @@ def scan_dataset_folder(root_folder):
 
         if ext in IMAGE_EXTENSIONS:
             images[base] = path
+            split = image_splits.split_from_path(path, root_folder)
+            if split:
+                splits[base] = split
         elif ext == ".xml":
             voc[base] = path
         elif ext == ".txt":
@@ -97,7 +102,7 @@ def scan_dataset_folder(root_folder):
 
     return {
         "images": images, "voc": voc, "yolo": yolo, "coco": coco,
-        "yolo_classes_file": yolo_classes_file,
+        "yolo_classes_file": yolo_classes_file, "splits": splits,
     }
 
 
@@ -508,6 +513,14 @@ def import_dataset(source_folder, workspace_name, prefix=None, progress_cb=None)
         if progress_cb:
             progress_cb(done, total, f"Copying images... {done}/{n_images}")
 
+    split_counts = {s: 0 for s in image_splits.SPLITS}
+    if scan["splits"]:
+        # the dataset came with its own train / valid / test folders: keep them (the rest stays Train)
+        assigned = {rename_map.get(b, b) + os.path.splitext(scan["images"][b])[1]: s for b, s in scan["splits"].items()}
+        image_splits.SplitStore(voc_dir).set_many(assigned)
+        for b in scan["images"]:
+            split_counts[scan["splits"].get(b, image_splits.TRAIN)] += 1
+
     class_order = list(existing_classes_for_workspace(workspace_name) or [])
     annotated = 0
 
@@ -531,4 +544,5 @@ def import_dataset(source_folder, workspace_name, prefix=None, progress_cb=None)
         "annotated_count": annotated,
         "format": format_labels[fmt],
         "classes": class_order,
+        "splits": split_counts if scan["splits"] else None,
     }

@@ -28,6 +28,7 @@ from .dataset_import import (scan_dataset_folder, detect_dataset_format, import_
                              yolo_classes_resolved, sanitize_filename_prefix)
 from . import collab
 from . import assistant_modes
+from . import splits as image_splits
 from . import relocate
 from . import workspace_manager
 from . import ServerSettingsDialog
@@ -1305,7 +1306,9 @@ class WorkspacePickerApp:
                 f'"{result["instance_name"]}" created with {result["image_count"]} image(s).\n\n'
                 f'Annotation format: {result["format"] or "none"}\n'
                 f'Annotated images: {result["annotated_count"]}\n'
-                f'Classes: {classes_text}',
+                f'Classes: {classes_text}'
+                + ("\nSplits: " + ", ".join(f"{image_splits.LABELS[k]} {n}" for k, n in result["splits"].items())
+                   if result.get("splits") else ""),
                 parent=self.root
             )
 
