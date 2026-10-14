@@ -15,6 +15,7 @@ Jelibox is designed for individuals and teams that need a private, offline-first
 - Local annotation workflow with no required cloud account
 - A VS Code-style workspace picker for switching between datasets
 - Bounding box annotation for object detection, with two tools like in Roboflow: **Draw box** and **Select** (move a box, resize it by its white corner dots, change its class from a menu, bring it to the front or send it to the back in the Layers list)
+- Train / Valid / Test split per image, with filters by split and by class in the image list (every mode)
 - Polygon annotation for image segmentation
 - Three annotation modes chosen on a front menu: **YOLO-World**, **LocateAnything** (NVIDIA LocateAnything-3B) and **Custom head** (a detector plus a head you trained) - see [Modes](#modes)
 - AI-assisted annotation on the current image (`G`) or on **every image of the dataset at once** (`Shift+G`, Auto-annotate all)
@@ -177,6 +178,8 @@ switch datasets without restarting the app.
 
 **Select tool.** A selected box shows a white dot on each corner. The *Class of selected box* menu above the image changes its class (a wrong auto-annotated class, right size), *Delete box* removes it. The **Layers** list on the left shows the boxes of the image, front (top) to back; *Bring to front*, *Send to back*, *Forward* and *Backward* reorder them, and the order of the list is the order of the lines in the saved label file (the number in front of a row is its line; the front box is the last line, and a new box starts in front). A click picks the box on top. This works the same in every mode (YOLO-World, LocateAnything, Custom head).
 
+**Splits and filters.** Every image is in the Train, Valid or Test split. A dataset imported with **Import Dataset** keeps its splits when its images sit in folders named `train` / `valid` (or `val`) / `test`, as in a Roboflow or Ultralytics export; images outside such folders are Train. The *Split* buttons next to *Delete box* show the split of the current image and move it to another one; the image list tags each row `TRN` / `VAL` / `TST`. Above the list, the split menu and the *Classes* menu (tick one or more classes; an image passes when it holds at least one of them) limit the list, and `Next` / `Prev` / `A` / `D` only visit the images that pass, so with *Train* chosen every image you reach is a Train image. Changing the split of the current image while a split filter hides it moves you on to the next image. The splits are saved in `vocdataset/<workspace>/splits.json` (images that are not in it are Train); the filters are not saved. Export Dataset uses them by default (see Exporting a Dataset); Train does not read them yet.
+
 In polygon mode, click to add points, double-click or press `Enter` to finish, and right-click a point to delete it.
 
 ## Workspace Structure
@@ -231,7 +234,13 @@ Jelibox supports:
 
 ## Exporting a Dataset
 
-Use the **Export Dataset** action in the application to export YOLO, Pascal VOC, or COCO data with train, validation, and test splits.
+Use the **Export Dataset** action in the application to export YOLO, Pascal VOC, or COCO data with train, validation, and test splits. The window has three steps, like Roboflow's *Create New Version*:
+
+1. **Split**: use the Train / Valid / Test split you assigned to every image (the counts are shown), or cut randomly by percentage with the slider (the number of images per split is shown; a seed makes it repeatable).
+2. **Preprocessing**: *Auto-Orient* writes pictures that carry an EXIF rotation upright with the tag removed, so the labels still fit in tools that ignore EXIF (other pictures are copied as they are). *Resize* stretches, fills with a centre crop, or fits the picture with black, white or reflected edges to the size you give; the labels move with the pixels.
+3. **Augmentation**: a gallery of Flip, 90° Rotate, Crop, Rotation, Shear, Grayscale, Hue, Saturation, Brightness, Exposure, Blur, Noise, Cutout and Motion Blur. Every tile shows the effect on a random picture of your dataset; click one to set its range with sliders and see the result before you apply it (*New preview picture* picks another picture). *Outputs per training image* is the Roboflow-style multiplier (2x, 3x, 4x, ...): every Train image becomes that many differently augmented pictures, written as `<name>_aug1`, `<name>_aug2`, ... and the original itself is not in the Train set (tick *Keep the original as one of them* to make it one of the N). Augmentation is **only for the Train split**; Valid and Test are never augmented. Labels are moved or dropped together with the pixels (an object that a crop pushes out of the picture is left out).
+
+Colour augmentations run on torchvision (`torchvision.transforms.v2.functional`); geometry is warped with a matrix that is also applied to the labels. Mosaic is not offered.
 
 COCO exports use this structure:
 

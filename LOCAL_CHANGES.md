@@ -94,6 +94,19 @@ Installing through `install.ps1` replaced the user's Python 3.10 setup:
 - `utils/assistant_modes.py`: Custom head card text for any task (title unchanged).
 - Tests: new cases in `tests/gui/test_gui_smoke.py` (draw over a box, move/clamp, corner resize, class menu + undo, frontmost pick, layer order in the saved lines). Only those were run, not the whole suite (by request).
 
+## Train / Valid / Test split and filters (eighth round)
+
+- New `utils/splits.py` (`SplitStore`, `ClassIndex`, `matching`); splits live in `vocdataset/<ws>/splits.json`, only valid/test stored, missing = Train.
+- `utils/AnnotationGUI.py`: *Split* buttons in the tool bar (after Delete box), split filter + class menu above the image list, `TRN/VAL/TST` tag per row, Next/Prev follow the filter (`_neighbour`, `_go_to`), delete image forgets its split.
+- `utils/dataset_import.py`: Import Dataset reads the split from folders named train / valid / val / test (`splits.split_from_path`) and stores it; the import message lists the counts. Checked on the Roboflow export `unictive_combined.yolov8` in a temp workspace: 448 Train / 282 Valid.
+- Tests: `tests/unit/test_splits.py`, `tests/integration/test_workspace_lifecycle.py` (split folders, flat folder), four cases in `tests/gui/test_gui_smoke.py`. Export / Train do not use the splits yet.
+
+## Export Dataset like Roboflow (ninth round)
+
+- New `utils/ExportDialog.py` (split slider with counts, preprocessing, augmentation gallery with live preview), `utils/dataset_export.py` (YOLO / VOC / COCO writers moved out of `AnnotationGUI`), `utils/export_preprocess.py` (Auto-Orient, Resize), `utils/augmentation.py` rewritten on torchvision with a Roboflow-style catalogue; `utils/augment_geometry.py` gained shear, crop, resize, `compose` and `keeps_box`.
+- Export now uses the splits assigned in Jelibox by default (random split by percentage is the other choice). Augmentation only for Train, as "Nx" (the N outputs replace the original; *Keep the original* makes it one of the N); the old per-op chance, Valid/Test augmentation and JPEG / contrast ops are gone.
+- Tests: `tests/unit/test_augmentation.py` (torchvision on one image), `tests/unit/test_augment_geometry.py`, `tests/integration/test_dataset_export.py` (Generate: augmented copies in Train only, all three formats, resize, EXIF), five window tests in `tests/gui/test_gui_smoke.py`.
+
 ## Verification
 - `python tests/run.py --only repo,unit`: all pass.
 - `tools/setup_python.ps1` run for real on Windows twice, in a temp folder: with uv already installed, and with uv hidden so the official installer ran (uv into a temp dir). Both produced a working Python 3.12.10 with Tkinter inside the folder; the user PATH was unchanged and `py --list` still shows only Python 3.10.
